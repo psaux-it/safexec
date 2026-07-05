@@ -98,7 +98,6 @@ $(BUILDDIR):
 $(TARGET): $(SRC) | $(BUILDDIR)
         $(CC) $(CPPFLAGS) $(CFLAGS) $(CF_HARDENING) $(SRC) -o $(TARGET) $(LDFLAGS)
 
-# Static musl build — matches the WordPress-direct-download release channel.
 # Not intended for distro packages (see README/INSTALL: static binaries are
 # discouraged by Debian/Fedora policy). Requires zig or a musl cross toolchain.
 #
@@ -118,7 +117,7 @@ static: | $(BUILDDIR)
 
 # aarch64 counterpart — CI builds both arches; this target existed only for
 # x86_64 before, so `make static` locally could not reproduce the aarch64
-# release artifact at all. Mirrors the CI aarch64 flags exactly.
+# release artifact at all.
 static-aarch64: CC = zig cc -target aarch64-linux-musl
 static-aarch64: CFLAGS += -static -mbranch-protection=standard -s
 static-aarch64: LDFLAGS = -Wl,-z,relro,-z,now
