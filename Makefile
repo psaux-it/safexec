@@ -93,10 +93,10 @@ endif
 all: $(TARGET)
 
 $(BUILDDIR):
-        mkdir -p $(BUILDDIR)
+	mkdir -p $(BUILDDIR)
 
 $(TARGET): $(SRC) | $(BUILDDIR)
-        $(CC) $(CPPFLAGS) $(CFLAGS) $(CF_HARDENING) $(SRC) -o $(TARGET) $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(CF_HARDENING) $(SRC) -o $(TARGET) $(LDFLAGS)
 
 # Not intended for distro packages (see README/INSTALL: static binaries are
 # discouraged by Debian/Fedora policy). Requires zig or a musl cross toolchain.
@@ -113,7 +113,7 @@ static: CC = zig cc -target x86_64-linux-musl
 static: CFLAGS += -static -fcf-protection=full -s
 static: LDFLAGS = -Wl,-z,relro,-z,now
 static: | $(BUILDDIR)
-        $(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) -o $(BUILDDIR)/safexec-x86_64-linux-musl $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) -o $(BUILDDIR)/safexec-x86_64-linux-musl $(LDFLAGS)
 
 # aarch64 counterpart — CI builds both arches; this target existed only for
 # x86_64 before, so `make static` locally could not reproduce the aarch64
@@ -122,48 +122,48 @@ static-aarch64: CC = zig cc -target aarch64-linux-musl
 static-aarch64: CFLAGS += -static -mbranch-protection=standard -s
 static-aarch64: LDFLAGS = -Wl,-z,relro,-z,now
 static-aarch64: | $(BUILDDIR)
-        $(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) -o $(BUILDDIR)/safexec-aarch64-linux-musl $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(SRC) -o $(BUILDDIR)/safexec-aarch64-linux-musl $(LDFLAGS)
 
 # Optional LD_PRELOAD normalization shim — opt-in, not part of `all`.
 norm: $(SOTARGET)
 
 $(SOTARGET): $(NORMSRC) | $(BUILDDIR)
-        $(CC) $(EXTRA_NORM_CPPFLAGS) $(NORM_CFLAGS) $(CF_HARDENING) \
-                $(NORMSRC) -o $(SOTARGET) $(NORM_LDFLAGS) $(NORM_LIBS)
+	$(CC) $(EXTRA_NORM_CPPFLAGS) $(NORM_CFLAGS) $(CF_HARDENING) \
+		$(NORMSRC) -o $(SOTARGET) $(NORM_LDFLAGS) $(NORM_LIBS)
 
 check: $(TARGET)
-        @./tests/run.sh ./$(TARGET)
+	@./tests/run.sh ./$(TARGET)
 
 # Alias
 test: check
 
 install: $(TARGET)
-        install -d -m 0755 $(DESTDIR)$(SBINDIR)
-        install -m 0755 $(TARGET) $(DESTDIR)$(SBINDIR)/safexec
-        install -d -m 0755 $(DESTDIR)$(MANDIR)
-        install -m 0644 $(MANPAGE) $(DESTDIR)$(MANDIR)/safexec.1
-        @echo ""
-        @echo "safexec installed to $(DESTDIR)$(SBINDIR)/safexec"
-        @echo "To enable privilege-dropping mode, run as root:"
-        @echo "  chown root:root $(DESTDIR)$(SBINDIR)/safexec"
-        @echo "  chmod 4755 $(DESTDIR)$(SBINDIR)/safexec"
-        @echo "(Ensure the install path is not on a nosuid-mounted filesystem.)"
+	install -d -m 0755 $(DESTDIR)$(SBINDIR)
+	install -m 0755 $(TARGET) $(DESTDIR)$(SBINDIR)/safexec
+	install -d -m 0755 $(DESTDIR)$(MANDIR)
+	install -m 0644 $(MANPAGE) $(DESTDIR)$(MANDIR)/safexec.1
+	@echo ""
+	@echo "safexec installed to $(DESTDIR)$(SBINDIR)/safexec"
+	@echo "To enable privilege-dropping mode, run as root:"
+	@echo "  chown root:root $(DESTDIR)$(SBINDIR)/safexec"
+	@echo "  chmod 4755 $(DESTDIR)$(SBINDIR)/safexec"
+	@echo "(Ensure the install path is not on a nosuid-mounted filesystem.)"
 
 # Must land in a path trusted by TRUSTED_LIB_ROOTS or injection is refused.
 install-norm: $(SOTARGET)
-        install -d -m 0755 $(DESTDIR)$(NPP_LIBDIR)
-        install -m 0644 $(SOTARGET) $(DESTDIR)$(NPP_LIBDIR)/libnpp_norm.so
-        @echo ""
-        @echo "libnpp_norm.so installed to $(DESTDIR)$(NPP_LIBDIR)/libnpp_norm.so"
-        @echo "If safexec doesn't pick it up automatically, set:"
-        @echo "  SAFEXEC_PCTNORM_SO=$(NPP_LIBDIR)/libnpp_norm.so"
-        @echo "Confirm this path resolves under safexec.c's TRUSTED_LIB_ROOTS"
-        @echo "(/usr/lib, /lib, /usr/lib64, /lib64) or injection will be refused."
+	install -d -m 0755 $(DESTDIR)$(NPP_LIBDIR)
+	install -m 0644 $(SOTARGET) $(DESTDIR)$(NPP_LIBDIR)/libnpp_norm.so
+	@echo ""
+	@echo "libnpp_norm.so installed to $(DESTDIR)$(NPP_LIBDIR)/libnpp_norm.so"
+	@echo "If safexec doesn't pick it up automatically, set:"
+	@echo "  SAFEXEC_PCTNORM_SO=$(NPP_LIBDIR)/libnpp_norm.so"
+	@echo "Confirm this path resolves under safexec.c's TRUSTED_LIB_ROOTS"
+	@echo "(/usr/lib, /lib, /usr/lib64, /lib64) or injection will be refused."
 
 uninstall:
-        rm -f $(DESTDIR)$(SBINDIR)/safexec
-        rm -f $(DESTDIR)$(MANDIR)/safexec.1
-        rm -f $(DESTDIR)$(NPP_LIBDIR)/libnpp_norm.so
+	rm -f $(DESTDIR)$(SBINDIR)/safexec
+	rm -f $(DESTDIR)$(MANDIR)/safexec.1
+	rm -f $(DESTDIR)$(NPP_LIBDIR)/libnpp_norm.so
 
 clean:
-        rm -rf $(BUILDDIR)
+	rm -rf $(BUILDDIR)
