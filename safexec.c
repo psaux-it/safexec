@@ -256,6 +256,7 @@ static int env_quiet_enabled(void) {
 
 // Quiet-aware logging layer
 static int QUIET = 0;
+static int g_keep_fd = -1;  /* fd that must survive closefrom_safe() before exec (rg cache dir) */
 static int s_printf(const char *fmt, ...) {
     if (QUIET) return 0;
     va_list ap; va_start(ap, fmt);
@@ -1291,55 +1292,54 @@ static void set_locale_utf8_best_effort(void) {
 }
 
 /*
- * Resolve the UID needed to read the nginx cache path by lstat()-ing
- * the path itself. This is the most reliable cross-environment method:
+ * Open the nginx cache directory and validate it in one shot via the open
+ * fd (fstat, not lstat-then-later-use-by-path). The caller execs rg against
+ * "/proc/self/fd/<this fd>" instead of the original path string, so the
+ * directory rg actually scans is guaranteed to be the exact object we
+ * validated here — there is no window between check and use for it to be
+ * swapped out from under us.
  *
- *   Monolithic:    lstat(/dev/shm/fastcgi-cache-psauxit) → nginx uid
- *   Containerized: original path is bind-mounted into the WP container
- *                  lstat() still works, returns the nginx uid
+ * O_DIRECTORY makes the kernel reject non-directories at open() time;
+ * O_NOFOLLOW makes it reject a symlink at the final path component. Both
+ * replace the separate lstat()/S_ISDIR()/S_ISLNK() checks the old path-based
+ * version needed. Deliberately NOT O_CLOEXEC: this fd must still be open in
+ * rg's own process image after execve() for /proc/self/fd/<n> to resolve.
  *
- * We never need to scan /proc or parse nginx.conf — the path owner
- * IS the user who can read it. Returns (uid_t)-1 on any failure.
- * Refuses symlinks (/dev/shm is 1777; any local user could plant one).
- * Refuses to return uid 0 (root) — if root owns the path, fall back
- * to FUSE mount in PHP (opendir check already handles this).
+ * Returns an open fd (caller owns it) and sets *out_owner on success, or -1
+ * on any validation failure.
  */
-static uid_t resolve_cache_path_owner(const char *cache_path) {
-    if (!cache_path || !*cache_path) return (uid_t)-1;
+static int open_and_verify_cache_dir(const char *cache_path, uid_t *out_owner) {
+    if (!cache_path || !*cache_path) return -1;
+
+    int fd = open(cache_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) {
+        s_fprintf(stderr,
+            "Error: safexec: open('%s') failed: %s\n", cache_path, strerror(errno));
+        return -1;
+    }
 
     struct stat st;
-    if (lstat(cache_path, &st) != 0) {
+    if (fstat(fd, &st) != 0) {
         s_fprintf(stderr,
-            "Error: safexec: lstat('%s') failed: %s\n", cache_path, strerror(errno));
-        return (uid_t)-1;
-    }
-
-    /* Reject symlinks unconditionally */
-    if (S_ISLNK(st.st_mode)) {
-        s_fprintf(stderr,
-            "Error: safexec: '%s' is a symlink\n", cache_path);
-        return (uid_t)-1;
-    }
-
-    /* Must be a directory */
-    if (!S_ISDIR(st.st_mode)) {
-        s_fprintf(stderr,
-            "Error: safexec: '%s' is not a directory\n", cache_path);
-        return (uid_t)-1;
+            "Error: safexec: fstat('%s') failed: %s\n", cache_path, strerror(errno));
+        close(fd);
+        return -1;
     }
 
     /* Refuse root — we cannot drop to root */
     if (st.st_uid == 0) {
         s_fprintf(stderr,
             "Error: safexec: '%s' is owned by root\n", cache_path);
-        return (uid_t)-1;
+        close(fd);
+        return -1;
     }
 
     s_fprintf(stderr,
         "Info: safexec: '%s' owned by uid=%lu\n",
         cache_path, (unsigned long)st.st_uid);
 
-    return st.st_uid;
+    *out_owner = st.st_uid;
+    return fd;
 }
 
 /*
@@ -1789,16 +1789,40 @@ int main(int argc, char *argv[]) {
 
     if (is_prog(argv[prog_i], "rg")) {
         const char *rg_cache_path = find_rg_cache_path(argc, argv, prog_i);
-        uid_t cache_owner = (rg_cache_path)
-            ? resolve_cache_path_owner(rg_cache_path)
-            : (uid_t)-1;
+        uid_t cache_owner = (uid_t)-1;
+        int cache_fd = rg_cache_path
+            ? open_and_verify_cache_dir(rg_cache_path, &cache_owner)
+            : -1;
 
-        if (cache_owner == (uid_t)-1) {
+        if (cache_fd < 0) {
             s_fprintf(stderr,
                 "Error: safexec: root-owned or invalid path; refusing exec\n");
             FREE_PCT();
             return 1;
         }
+
+        /*
+         * Rewrite rg's path argument to "/proc/self/fd/<n>" so rg scans the
+         * exact directory object we just validated, closing the TOCTOU gap
+         * between this check and the later execvp(). The fd must stay open
+         * (not CLOEXEC) and must be excluded from closefrom_safe() below;
+         * g_keep_fd carries it through to that point.
+         */
+        char fdpath[64];
+        if (safe_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", cache_fd) != 0) {
+            s_fprintf(stderr, "Error: safexec: failed to compose fd path\n");
+            close(cache_fd);
+            FREE_PCT();
+            return 1;
+        }
+        argv[argc - 1] = strdup(fdpath);
+        if (!argv[argc - 1]) {
+            s_fprintf(stderr, "Error: safexec: OOM while pinning cache fd path\n");
+            close(cache_fd);
+            FREE_PCT();
+            return 1;
+        }
+        g_keep_fd = cache_fd;
 
         if (cache_owner == ruid) {
             s_fprintf(stderr,
@@ -1812,6 +1836,7 @@ int main(int argc, char *argv[]) {
             s_fprintf(stderr,
                 "Error: safexec: uid %lu not in passwd; refusing exec\n",
                 (unsigned long)cache_owner);
+            close(cache_fd);
             FREE_PCT();
             return 1;
         }
