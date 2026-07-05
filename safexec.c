@@ -1371,13 +1371,28 @@ static void sanitize_process_early(void) {
 #endif
 }
 
-// Close all inherited fds >= 3
-static void closefrom_safe(int lowfd) {
+// Close all inherited fds >= lowfd, except keep_fd (if >= 0)
+static void closefrom_safe(int lowfd, int keep_fd) {
+#if defined(__linux__) && defined(__NR_close_range)
+    /* Fast path: one syscall closes the whole range (Linux 5.9+). No glibc
+     * wrapper required — call the raw syscall directly so this still works
+     * on glibc < 2.34. Falls through to the /proc scan on ENOSYS (older
+     * kernel) or any other failure. Skipped entirely when a fd must be
+     * preserved (keep_fd >= 0), since close_range() can't selectively skip
+     * one fd in the middle of the range. */
+    if (keep_fd < 0) {
+        if (syscall(__NR_close_range, (unsigned int)lowfd, ~0U, 0) == 0)
+            return;
+    }
+#endif
     DIR *d = opendir("/proc/self/fd");
     if (!d) {
         long max = sysconf(_SC_OPEN_MAX);
         if (max < 0 || max > 65536) max = 1024;
-        for (int fd = lowfd; fd < max; ++fd) close(fd);
+        for (int fd = lowfd; fd < max; ++fd) {
+            if (fd == keep_fd) continue;
+            close(fd);
+        }
         return;
     }
     int dirfdno = dirfd(d);
@@ -1387,7 +1402,7 @@ static void closefrom_safe(int lowfd) {
         char *end = NULL;
         long fd = strtol(de->d_name, &end, 10);
         if (end && *end) continue;
-        if (fd >= lowfd && fd != dirfdno) close((int)fd);
+        if (fd >= lowfd && fd != dirfdno && fd != keep_fd) close((int)fd);
     }
     closedir(d);
 }
@@ -1875,8 +1890,8 @@ post_drop:
     if (cgv2_self_dir(selfcg, sizeof selfcg) != 0) selfcg[0] = '\0';
      report_summary(abs_tool, selfcg);
 
-    // Close all inherited fds except stdio before exec
-    closefrom_safe(3);
+    // Close all inherited fds except stdio (and the pinned rg cache fd, if any) before exec
+    closefrom_safe(3, g_keep_fd);
 
     fflush(NULL);
     execvp(argv[1], &argv[1]);
