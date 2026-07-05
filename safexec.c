@@ -256,7 +256,8 @@ static int env_quiet_enabled(void) {
 
 // Quiet-aware logging layer
 static int QUIET = 0;
-static int g_keep_fd = -1;  /* fd that must survive closefrom_safe() before exec (rg cache dir) */
+static int g_keep_fd = -1;   /* fd that must survive closefrom_safe() before exec (rg cache dir) */
+static int g_keep_fd2 = -1;  /* fd that must survive closefrom_safe() before exec (pctnorm .so, see is_secure_so_fd) */
 static int s_printf(const char *fmt, ...) {
     if (QUIET) return 0;
     va_list ap; va_start(ap, fmt);
@@ -288,28 +289,37 @@ static int has_trusted_root(const char *real) {
     return 0;
 }
 
-static int is_secure_so(const char *path) {
-    if (!path || !*path) return 0;
+/*
+ * Validate the pctnorm shared object at 'path' and, on success, return an
+ * *open, already-validated* file descriptor referring to the exact object
+ * that was checked — not merely a path string.
+ *
+ * Returns a valid, open fd (caller owns it and must keep it alive — see
+ * g_keep_fd2) on success, or -1 on any validation failure (nothing left
+ * open in that case).
+ */
+static int is_secure_so_fd(const char *path) {
+    if (!path || !*path) return -1;
 
     char real[PATH_MAX];
-    if (!realpath(path, real)) return 0;
+    if (!realpath(path, real)) return -1;
 
-    if (!has_trusted_root(real)) return 0;
+    if (!has_trusted_root(real)) return -1;
 
     const char *base = strrchr(real, '/');
     base = base ? base + 1 : real;
-    if (strcmp(base, "libnpp_norm.so") != 0) return 0;
+    if (strcmp(base, "libnpp_norm.so") != 0) return -1;
 
-    int fd = open(real, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) return 0;
+    int fd = open(real, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return -1;
 
     struct stat st;
     int ok = (fstat(fd, &st) == 0) &&
              S_ISREG(st.st_mode) &&
              st.st_uid == 0 && st.st_gid == 0 &&
              ((st.st_mode & 022) == 0);
-    close(fd);
-    return ok;
+    if (!ok) { close(fd); return -1; }
+    return fd;
 }
 static char *dup_or_null(const char *s) { return s ? strdup(s) : NULL; }
 
@@ -1371,16 +1381,16 @@ static void sanitize_process_early(void) {
 #endif
 }
 
-// Close all inherited fds >= lowfd, except keep_fd (if >= 0)
-static void closefrom_safe(int lowfd, int keep_fd) {
+// Close all inherited fds >= lowfd, except keep_fd/keep_fd2 (if >= 0)
+static void closefrom_safe(int lowfd, int keep_fd, int keep_fd2) {
 #if defined(__linux__) && defined(__NR_close_range)
     /* Fast path: one syscall closes the whole range (Linux 5.9+). No glibc
      * wrapper required — call the raw syscall directly so this still works
      * on glibc < 2.34. Falls through to the /proc scan on ENOSYS (older
      * kernel) or any other failure. Skipped entirely when a fd must be
-     * preserved (keep_fd >= 0), since close_range() can't selectively skip
-     * one fd in the middle of the range. */
-    if (keep_fd < 0) {
+     * preserved (keep_fd/keep_fd2 >= 0), since close_range() can't
+     * selectively skip a fd in the middle of the range. */
+    if (keep_fd < 0 && keep_fd2 < 0) {
         if (syscall(__NR_close_range, (unsigned int)lowfd, ~0U, 0) == 0)
             return;
     }
@@ -1390,7 +1400,7 @@ static void closefrom_safe(int lowfd, int keep_fd) {
         long max = sysconf(_SC_OPEN_MAX);
         if (max < 0 || max > 65536) max = 1024;
         for (int fd = lowfd; fd < max; ++fd) {
-            if (fd == keep_fd) continue;
+            if (fd == keep_fd || fd == keep_fd2) continue;
             close(fd);
         }
         return;
@@ -1402,7 +1412,7 @@ static void closefrom_safe(int lowfd, int keep_fd) {
         char *end = NULL;
         long fd = strtol(de->d_name, &end, 10);
         if (end && *end) continue;
-        if (fd >= lowfd && fd != dirfdno && fd != keep_fd) close((int)fd);
+        if (fd >= lowfd && fd != dirfdno && fd != keep_fd && fd != keep_fd2) close((int)fd);
     }
     closedir(d);
 }
@@ -1891,13 +1901,27 @@ post_drop:
     /* LD_PRELOAD shim injection: only for wget/curl, only if possible. */
     if (pct_enable && (is_prog(argv[prog_i], "wget") || is_prog(argv[prog_i], "curl"))) {
         const char *so = pct_so ? pct_so : "/usr/lib/npp/libnpp_norm.so";
-        if (is_secure_so(so)) {
-            const char *case_val = (pct_case && *pct_case) ? pct_case : "upper";
-            setenv("LD_PRELOAD", so, 1);
-            setenv("PCTNORM_CASE", case_val, 1);
-            s_fprintf(stderr,
-                      "Info: Injected: LD_PRELOAD=%s PCTNORM_CASE=%s (prog=%s)\n",
-                      so, case_val, base_of(argv[prog_i]));
+        int so_fd = is_secure_so_fd(so);
+        if (so_fd >= 0) {
+            char fdpath[64];
+            if (safe_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", so_fd) != 0) {
+                s_fprintf(stderr, "Info: Not injecting LD_PRELOAD shim (fd path overflow)\n");
+                close(so_fd);
+            } else {
+                const char *case_val = (pct_case && *pct_case) ? pct_case : "upper";
+                /* Inject the FD-PINNED path, not the original 'so' string:
+                 * /proc/self/fd/<n> always refers to the specific,
+                 * already-validated inode, immune to the original path
+                 * being retargeted (symlink swap, rename, etc.) in the
+                 * window between validation and the dynamic linker's own
+                 * lookup at exec time. */
+                setenv("LD_PRELOAD", fdpath, 1);
+                setenv("PCTNORM_CASE", case_val, 1);
+                g_keep_fd2 = so_fd;  /* must survive closefrom_safe() and stay open across execve() */
+                s_fprintf(stderr,
+                          "Info: Injected: LD_PRELOAD=%s (validated:'%s') PCTNORM_CASE=%s (prog=%s)\n",
+                          fdpath, so, case_val, base_of(argv[prog_i]));
+            }
         } else {
             s_fprintf(stderr, "Info: Not injecting LD_PRELOAD shim (unsafe or missing so: %s)\n", so);
         }
@@ -1915,8 +1939,8 @@ post_drop:
     if (cgv2_self_dir(selfcg, sizeof selfcg) != 0) selfcg[0] = '\0';
      report_summary(abs_tool, selfcg);
 
-    // Close all inherited fds except stdio (and the pinned rg cache fd, if any) before exec
-    closefrom_safe(3, g_keep_fd);
+    // Close all inherited fds except stdio (and the pinned rg cache / pctnorm .so fd, if any) before exec
+    closefrom_safe(3, g_keep_fd, g_keep_fd2);
 
     fflush(NULL);
     execvp(argv[1], &argv[1]);
