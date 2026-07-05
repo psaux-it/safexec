@@ -1,0 +1,619 @@
+.\" SPDX-License-Identifier: GPL-2.0-only
+.\" Man page for safexec, part of NPP (Nginx Cache Purge Preload) for WordPress
+.TH SAFEXEC 1 "2025" "safexec 1.9.6" "User Commands"
+.SH NAME
+safexec \- secure privilege-dropping wrapper for controlled external command execution
+.SH SYNOPSIS
+.B safexec
+.RI [ wrapper " " args ...]
+.I program
+.RI [ args ... ]
+.br
+.B safexec
+.BI --kill= pid
+.br
+.B safexec
+.RB { --help | -h }
+.br
+.B safexec
+.RB { --version | -v }
+.SH DESCRIPTION
+.B safexec
+executes a restricted, compile-time allowlisted set of external programs
+(e.g.
+.BR wget (1),
+.BR curl (1))
+from higher-level contexts such as PHP. It is the privilege-dropping
+backend used by the NPP (Nginx Cache Purge Preload) WordPress plugin in
+place of a raw
+.B shell_exec()
+call.
+.PP
+When installed setuid-root,
+.B safexec
+sanitizes its environment, resolves the requested tool (and any leading
+wrapper commands) to absolute paths under trusted system directories,
+drops privileges before exec, and applies best-effort resource isolation
+(cgroup v2, or a POSIX rlimits fallback).
+.PP
+When the effective uid at runtime is not 0 (not installed setuid-root, or
+setuid bit lost/ignored, e.g. on a
+.B nosuid
+mount), it runs in
+.B pass-through mode
+instead: the allowlist and absolute-path pinning are still enforced, but
+environment sanitization, privilege dropping, resource isolation, and the
+percent-encoding normalization shim (see
+.B PCTNORM
+below) are all skipped, and the target is exec'd immediately as the
+original caller.
+.SH ALLOWED PROGRAMS
+Only the following compile-time allowlisted binaries may be executed
+(anything else is refused with a diagnostic on stderr):
+.TP
+.B Scan
+.BR rg (1)
+.TP
+.B Fetch
+.BR wget (1),
+.BR curl (1)
+.TP
+.B Archives
+.BR tar (1),
+.BR gzip (1),
+.BR gunzip (1),
+.BR xz (1),
+.BR unxz (1),
+.BR zip (1),
+.BR unzip (1)
+.TP
+.B Checksums
+.BR sha256sum (1),
+.BR sha512sum (1),
+.BR shasum (1),
+.BR b2sum (1),
+.BR cksum (1)
+.TP
+.B Media / images
+.BR ffmpeg (1),
+.BR ffprobe (1),
+.BR magick (1),
+.BR convert (1),
+.BR identify (1)
+.TP
+.B Documents
+.BR wkhtmltopdf (1),
+.BR pdftk (1),
+.BR pandoc (1)
+.PP
+The following buckets are compiled in only if the corresponding
+preprocessor macro was defined at build time (see
+.B OPTIONAL TOOL BUCKETS
+below):
+.BR gs ;
+.BR pdfinfo ,
+.BR pdftoppm ,
+.BR pdftocairo ;
+.BR mysqldump ,
+.BR mysql ,
+.BR mariadb-dump ,
+.BR mariadb ,
+.BR pg_dump ,
+.BR pg_restore ,
+.BR psql ,
+.BR redis-cli ;
+.BR rsync ,
+.BR git .
+.SH COMMAND PRELUDE
+Before the target program, a limited prelude of tokens may appear. Each
+token in
+.IR argv [1.. N -1]
+is scanned in order (up to the point where an allowed program name is
+recognized, which becomes the target) and must be one of:
+.TP
+.B A wrapper command
+One of
+.BR nohup ,
+.BR nice ,
+.BR timeout ,
+.BR stdbuf ,
+.BR ionice ,
+.BR taskset ,
+.BR setsid ,
+.BR chrt ,
+.BR time .
+If given as a bare name, it is later resolved and pinned to an absolute
+path under a trusted directory, exactly like the target program. If given
+as an explicit path (containing
+.BR / ),
+that path is validated immediately: it must lie under a trusted binary
+directory, and if it is a symlink, its resolved target must also lie
+under a trusted directory \(em otherwise the whole prelude is rejected.
+.TP
+.B An option-looking token
+Any token beginning with
+.B -
+(or exactly
+.BR -- )
+is passed through unexamined (e.g.
+.B -n
+for
+.BR nice ,
+.B 30
+for
+.BR timeout ).
+.TP
+.B A signed integer
+A bare token consisting only of digits (optionally prefixed with
+.B +
+or
+.BR - )
+is passed through, to support numeric arguments to wrapper commands
+(e.g. the delay argument to
+.BR timeout ).
+.TP
+.B A NAME=VALUE assignment
+Permitted only for a fixed proxy-related allowlist:
+.BR HTTP_PROXY ,
+.BR HTTPS_PROXY ,
+.BR ALL_PROXY ,
+.BR NO_PROXY
+(and their lowercase equivalents). Any other assignment is rejected,
+including but not limited to
+.BR PATH ,
+.BR IFS ,
+.BR LD_PRELOAD ,
+.BR LD_AUDIT ,
+.BR LD_LIBRARY_PATH ,
+.BR LD_DEBUG ,
+.BR LD_ASSUME_KERNEL ,
+.BR LD_ORIGIN_PATH ,
+.BR LD_BIND_NOW ,
+any
+.BI DYLD_ *
+variable,
+.BR PYTHONPATH ,
+.BR PERL5OPT ,
+.BR RUBYOPT ,
+.BR GEM_HOME ,
+.BR GEM_PATH ,
+.BR GCONV_PATH ,
+.BR LOCPATH ,
+.BR TZDIR ,
+and
+.BR MALLOC_CONF .
+Unrecognized assignments are rejected by default.
+.PP
+A shell interpreter
+.RB ( sh ", " bash ", " dash ", " ash ", " zsh ", " ksh ", " fish )
+appearing anywhere in the prelude is explicitly rejected (e.g.
+.B "safexec sh -c ..."
+or
+.BR "safexec /bin/sh ..." ),
+regardless of any later allowed tool name in the argument list. Any other
+unrecognized token ends the prelude scan at that point; if the token is
+not itself an allowed program name, execution is refused.
+.SH SECURITY MODEL
+.TP
+.B Absolute-path pinning
+The target program (and any bare-name wrapper commands preceding it) is
+resolved to an absolute path under a trusted directory \(em
+.IR /usr/bin ", " /bin ", " /usr/local/bin ", " /usr/sbin ", " /sbin ,
+.IR /usr/local/sbin ", " /run/current-system/sw/bin ", " /usr/pkg/bin ,
+.I /usr/pkg/sbin
+(NetBSD pkgsrc), and on macOS also
+.IR /opt/homebrew/bin ", " /opt/homebrew/sbin ", " /opt/local/bin ,
+.I /opt/local/sbin
+\(em before exec. Regular files are accepted directly. Symlinks are
+followed only when the resolved target still lives under a trusted
+directory (this covers Alpine/BusyBox multi-call binaries such as
+.B nohup
+symlinked to
+.BR coreutils );
+the symlink path itself, not the resolved path, is what gets exec'd, so
+the kernel sets
+.B argv[0]
+correctly for multi-call binaries. If no trusted candidate is found,
+execution is refused.
+.TP
+.B Never exec as root
+The target is never exec'd as root. Privileges are dropped to the
+.B nobody
+user before exec (except for
+.BR rg ,
+see
+.B "RG-SPECIFIC BEHAVIOR"
+below); if the drop fails, safexec falls back to the original caller's
+uid/gid (e.g. the PHP-FPM worker's). If the effective uid is still 0 at
+any point before exec, safexec aborts rather than proceed.
+.TP
+.B Environment sanitization
+The environment is fully cleared early, then a minimal
+.BR PATH ,
+.BR LANG / LC_CTYPE / CHARSET
+are set. The process umask is forced to
+.B 077
+and core dumps are disabled via
+.BR PR_SET_DUMPABLE (0)
+(Linux). Immediately before exec,
+.B PR_SET_NO_NEW_PRIVS
+is set to prevent the child from regaining privileges.
+.TP
+.B File descriptor hygiene
+All inherited file descriptors numbered 3 and above are closed before
+exec (via a single
+.B close_range()
+syscall on Linux 5.9+, falling back to scanning
+.I /proc/self/fd
+otherwise), except for any file descriptor
+.B safexec
+itself opened and validated for the exec (the
+.B rg
+cache directory fd, or the pctnorm shared-object fd), which must survive
+into the child.
+.TP
+.B Resource isolation (Linux)
+The process is moved into its own cgroup v2 child, named
+.BI nppp. pid ,
+always created under
+.IR /sys/fs/cgroup/nppp ,
+regardless of the session/service cgroup subtree the caller started in.
+Relevant controllers
+.RI ( memory ", " pids ", " cpu ", " io ", " cpuset )
+are enabled on that parent where possible, and
+.B cpuset.cpus
+/
+.B cpuset.mems
+are propagated from parent to child when the child does not already set
+them. Threaded cgroup subtrees are handled by moving the calling thread
+into
+.I cgroup.threads
+and marking the child cgroup
+.B threaded
+when required. If cgroup v2 is unavailable, isolation falls back to
+POSIX rlimits (with optional nice/ionice adjustments, unused by default).
+.SH RG-SPECIFIC BEHAVIOR
+Unlike every other allowed program,
+.B rg
+(ripgrep) does not drop privileges to
+.BR nobody .
+Instead:
+.IP \(bu 3
+The last command-line argument is assumed to be an absolute path to the
+Nginx cache directory being scanned. It is opened directly with
+.B O_DIRECTORY|O_NOFOLLOW
+and validated via the resulting file descriptor (not by path, avoiding a
+check/use race). A directory owned by
+.B root
+is always refused.
+.IP \(bu 3
+The path argument passed to
+.B rg
+is rewritten to
+.BI /proc/self/fd/ n ,
+referring to the exact, already-validated directory file descriptor, so
+the directory
+.B rg
+actually scans cannot be swapped out between the validation check and
+exec.
+.IP \(bu 3
+If the cache directory's owner uid matches the original caller's real
+uid,
+.B safexec
+skips the privilege drop entirely and continues as the original caller.
+.IP \(bu 3
+Otherwise, safexec drops to the uid that owns the cache directory (which
+must resolve to a valid
+.I passwd
+entry), not to
+.BR nobody .
+If that uid cannot be resolved, execution is refused.
+.SH KILL MODE
+.BI --kill= pid
+terminates a process previously started by
+.BR safexec .
+The request succeeds only if both conditions hold:
+.IP \(bu 3
+The target process's real uid, read from
+.IR /proc/ pid /status ,
+matches the resolved uid of
+.BR nobody .
+.IP \(bu 3
+The target process belongs to an
+.BI nppp. *
+safexec cgroup, per
+.IR /proc/ pid /cgroup .
+.PP
+If the cgroup check fails (for example, in a container without cgroup
+delegation),
+.B safexec
+falls back to checking the target's
+.B NoNewPrivs
+flag in
+.IR /proc/ pid /status :
+if it is set, the kill proceeds anyway (since
+.B safexec
+itself sets this flag on every child it starts); if not set, the kill is
+refused.
+.PP
+Where the kernel supports it,
+.BR pidfd_open (2)
+/
+.BR pidfd_send_signal (2)
+are used to avoid PID-reuse race conditions; otherwise plain
+.BR kill (2)
+with
+.B SIGTERM
+is used as a fallback. This mode is Linux-only.
+.SH PERCENT-ENCODING NORMALIZATION (PCTNORM)
+When enabled
+.RI ( "and only in privileged mode \(em never in pass-through mode" ),
+.B safexec
+can normalize percent-encoded characters in URLs passed to
+.B wget
+or
+.B curl
+by preloading a shared object via
+.BR LD_PRELOAD .
+Controlled by:
+.TP
+.B SAFEXEC_PCTNORM=1|0
+Enable or disable the shim. Default: enabled
+.RB ( 1 ).
+.TP
+.B SAFEXEC_PCTNORM_SO=/path/to/libnpp_norm.so
+Path to the shim shared object. Default:
+.IR /usr/lib/npp/libnpp_norm.so .
+.TP
+.B SAFEXEC_PCTNORM_CASE=upper|lower|off
+Case normalization mode. Default:
+.BR upper .
+.PP
+The shared object is only ever injected for
+.B wget
+or
+.B curl
+invocations, and only after validation: it must resolve (via
+.BR realpath (3))
+to a regular file located beneath a trusted library root
+.RI ( /usr/lib ", " /lib ", " /usr/lib64 ", " /lib64 ),
+owned by
+.IR root:root ,
+not group- or other-writable, and named exactly
+.IR libnpp_norm.so .
+The file is opened and validated once; on success,
+.B LD_PRELOAD
+is set to a
+.I /proc/self/fd
+reference to that already-open, already-checked descriptor \(em not the
+original path string \(em so the object cannot be swapped out between
+validation and the dynamic linker's own lookup at exec time. If
+validation fails for any reason, the shim is silently skipped (a
+diagnostic is still printed to stderr) and the environment remains
+minimal.
+.SH ENVIRONMENT
+.TP
+.BI SAFEXEC_DETACH= mode
+Selects the isolation strategy.
+.I mode
+is one of:
+.RS
+.TP
+.B auto
+(default) Prefer cgroup v2; fall back to rlimits if unavailable.
+.TP
+.B cgv2
+Require cgroup v2; fail if it cannot be established.
+.TP
+.B rlimits
+Skip cgroups; apply rlimits (and optional nice/ionice) only.
+.TP
+.B off
+Apply no isolation tweaks at all.
+.RE
+.IP
+Read via
+.BR secure_getenv (3)
+on glibc builds, or plain
+.BR getenv (3)
+on musl (which does not provide
+.BR secure_getenv ).
+.TP
+.B SAFEXEC_QUIET=0|1
+Suppress informational messages. Default:
+.BR 0 .
+.TP
+.BI SAFEXEC_SAFE_CWD= mode
+.BR -1 ,
+.BR 0 ,
+or
+.BR 1 .
+If
+.BR 1 ,
+.B safexec
+changes to
+.I /tmp
+(or
+.I /
+as a last resort) when the current working directory is inaccessible. If
+.B -1
+(default), this is enabled only for interactive sessions (any of
+stdin/stdout/stderr attached to a TTY).
+.TP
+.B SAFEXEC_PCTNORM, SAFEXEC_PCTNORM_SO, SAFEXEC_PCTNORM_CASE
+See
+.B "PERCENT-ENCODING NORMALIZATION (PCTNORM)"
+above.
+.SH BEHAVIOR NOTES
+.IP \(bu 3
+A fresh per-run cgroup name
+.RI ( nppp. pid )
+is used on every invocation. Empty, stale
+.BI nppp. *
+cgroups (in both the session/service subtree and the global
+.I /sys/fs/cgroup/nppp
+parent) are cleaned up automatically at the start of each run.
+.IP \(bu 3
+Locale selection is attempted in order:
+.BR C.UTF-8 ,
+then
+.BR en_US.UTF-8 ,
+then
+.BR C .
+.B CHARSET
+is also set to aid BusyBox
+.BR wget .
+.IP \(bu 3
+If
+.I /tmp
+is not writable by the final effective uid and the command being run is
+.B wget
+with exactly
+.B "-P /tmp"
+as adjacent arguments,
+.B safexec
+rewrites the destination to
+.IR /tmp/nppp-cache/ euid ,
+provided the parent directory
+.I /tmp/nppp-cache
+is root-owned, mode
+.BR 01777 ,
+and not a symlink (safexec ensures this directory exists on every
+privileged run). Otherwise the original
+.B "-P /tmp"
+argument is left untouched and a warning is printed.
+.IP \(bu 3
+On platforms lacking
+.BR O_NOFOLLOW ,
+open-time symlink protection is compiled out (reduced at build time).
+.SH PORTABILITY
+On Linux,
+.B safexec
+supports cgroup v2 joining, pidfd-based process termination where the
+kernel provides it, I/O priority adjustment, POSIX rlimits, single-syscall
+file-descriptor closing via
+.BR close_range (2)
+(with a
+.I /proc/self/fd
+scan fallback),
+.BR PR_SET_NO_NEW_PRIVS ,
+and
+.BR PR_SET_DUMPABLE (0).
+.PP
+On BSD, macOS, and other POSIX systems, only rlimits and file-descriptor
+closing are applied; cgroup and pidfd support are Linux-only, and
+.B --kill
+is refused outright on non-Linux systems.
+.SH OPTIONAL TOOL BUCKETS (BUILD-TIME)
+Additional allowlisted tools may be compiled in via preprocessor defines,
+combined as needed:
+.TP
+.B -DSAFEXEC_WITH_GS
+Adds
+.BR gs (1)
+(Ghostscript) for PostScript/PDF rasterization. Off by default:
+Ghostscript has a long history of sandbox-escape and RCE CVEs via
+crafted PS/PDF input. Enable only if PS/PDF rasterization is specifically
+required and this exposure is understood.
+.TP
+.B -DSAFEXEC_WITH_POPPLER
+Adds
+.BR pdfinfo (1),
+.BR pdftoppm (1),
+.BR pdftocairo (1).
+.TP
+.B -DSAFEXEC_WITH_DB
+Adds database client/dump tools:
+.BR mysqldump ,
+.BR mysql ,
+.BR mariadb-dump ,
+.BR mariadb ,
+.BR pg_dump ,
+.BR pg_restore ,
+.BR psql ,
+.BR redis-cli .
+Enable only where intended.
+.TP
+.B -DSAFEXEC_WITH_RSYNC_GIT
+Adds
+.BR rsync (1)
+and
+.BR git (1).
+Both can indirectly invoke
+.BR ssh (1)
+(via
+.B "rsync -e"
+or
+.B git+ssh://
+remotes), which escapes the allowlist's assumption of a closed set of
+non-networked, no-shell-out tools. Enable only if you control how these
+binaries are invoked.
+.SH INSTALLATION
+It is recommended to install
+.B safexec
+setuid-root:
+.PP
+.RS
+.nf
+chown root:root safexec
+chmod 4755 safexec
+.fi
+.RE
+.PP
+Ensure the install location is not on a
+.B nosuid
+-mounted filesystem, or the setuid bit will be ignored by the kernel and
+.B safexec
+will silently run in pass-through mode on every invocation.
+.SH EXIT STATUS
+.TP
+.B 0
+Success: the target program was exec'd, or
+.BR --help / --version
+was requested, or
+.B --kill
+succeeded.
+.TP
+.B 1
+Usage error, disallowed program, prelude validation failure, privilege-drop
+failure, or exec failure.
+.SH LIMITATIONS
+.B safexec
+is not a general-purpose sandbox. It constrains only the process it
+execs and that process's descendants; it does not provide syscall-level
+filtering. Only allowlisted tools may be run through the prelude rules
+described above \(em arbitrary commands or shell pipelines are rejected.
+.SH EXAMPLES
+Fetch a URL with resource isolation applied automatically when installed
+setuid-root:
+.PP
+.RS
+.nf
+safexec wget -q -O /tmp/nppp-cache/out.html https://example.com/
+.fi
+.RE
+.PP
+Run with a wrapper command and a numeric argument in the prelude:
+.PP
+.RS
+.nf
+safexec timeout 30 wget -q -O /tmp/out.html https://example.com/
+.fi
+.RE
+.PP
+Terminate a previously started safexec child by PID:
+.PP
+.RS
+.nf
+safexec --kill=12345
+.fi
+.RE
+.SH AUTHOR
+Hasan Calisir <hasan.calisir@psauxit.com>
+.SH SEE ALSO
+.BR wget (1),
+.BR curl (1),
+.BR rg (1),
+.BR cgroups (7),
+.BR pidfd_open (2),
+.BR prctl (2)
