@@ -1,118 +1,124 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * safexec.c — Secure privilege-dropping wrapper for controlled shell execution
+ * safexec - privilege-dropping exec wrapper for a fixed set of tools
  *
  * Purpose
- * -------
- * Safely execute a *restricted* set of external programs (wget, curl, etc.)
- * from higher-level contexts such as PHP. Designed primarily as the backend
- * for shell_exec() in NPP (Nginx Cache Purge Preload).
+ *   Lets an unprivileged service (web application, scheduler, job runner,
+ *   automation agent) launch a small, fixed set of command-line tools
+ *   without ever running them as root and without handing the caller a
+ *   general shell. safexec is installed setuid root, validates the request,
+ *   pins the tool to a trusted absolute path, isolates the process, drops
+ *   privileges and only then execs the tool.
  *
- * Security model
- * ---------------
- *  - Strict allowlist: only known-safe binaries run (see ALLOWED_BINS).
- *  - Absolute-path pinning: the chosen tool is resolved to an absolute path
- *    under trusted system dirs before exec (e.g. /usr/bin, /bin, /usr/local/bin,
- *    /usr/sbin, /sbin, /usr/local/sbin, /run/current-system/sw/bin,
- *    /usr/pkg/{bin,sbin} for NetBSD pkgsrc, /opt/homebrew/{bin,sbin} for
- *    macOS Apple Silicon, /opt/local/{bin,sbin} for MacPorts).
- *    Regular files are accepted directly. Symlinks are followed only when the
- *    resolved target still resides under a trusted dir (Alpine/BusyBox multi-call
- *    binaries such as nohup -> coreutils). The symlink path is exec'd so the
- *    kernel sets argv[0] correctly for multi-call binaries.
- *    If not found or resolved target is outside trusted dirs, execution is refused.
- *  - Never exec as root: drop to 'nobody' first; if that fails, drop to the
- *    original caller (e.g., PHP-FPM worker). If we still have euid==0, abort.
- *  - Environment is sanitized early (clearenv); minimal PATH/LANG/LC_CTYPE/CHARSET
- *    are set, umask is forced to 077, and PR_SET_DUMPABLE(0) disables core dumps.
- *    PR_SET_NO_NEW_PRIVS(1) is set before exec to prevent privilege regain.
- *  - All inherited FDs >= 3 are closed before exec via /proc/self/fd (with a
- *    sysconf fallback).
- *  - Linux: process is moved into its own cgroup v2 child "nppp.<pid>" **under
- *    /sys/fs/cgroup/nppp**; if unavailable, fall back to rlimits (+ optional
- *    nice/ionice). Controllers are enabled on the parent when possible; cpuset
- *    values are propagated to the child. Threaded subtrees are handled with
- *    cgroup.threads and child marked "threaded" when required.
- *  - --kill=<pid>: only succeeds if the target is owned by 'nobody' *and*
- *    belongs to an "nppp.*" safexec cgroup; uses pidfd when available (race-safe),
- *    otherwise falls back to kill(). Ownership is checked via /proc/<pid>/status.
+ * Usage
+ *   safexec [wrapper ...] <tool> [args ...]
+ *   safexec --kill=<pid>
+ *   safexec --help | -h
+ *   safexec --version | -v
  *
- * Optional normalization (pctnorm)
- * --------------------------------
- * If enabled, safexec can normalize percent-encodings for wget/curl by
- * preloading a shared object:
- *    - SAFEXEC_PCTNORM=1|0         (default 1)
- *    - SAFEXEC_PCTNORM_SO=/path/to/libnpp_norm.so
- *    - SAFEXEC_PCTNORM_CASE=upper|lower|off  (default upper)
- * The .so is injected *only* for wget/curl, and only if it is a regular file,
- * root:root, not group/other-writable, and located beneath a trusted lib root
- * (/usr/lib, /lib, /usr/lib64, /lib64). The basename must be "libnpp_norm.so".
- * When injected, safexec sets:
- *    - LD_PRELOAD=<SO>, PCTNORM_CASE=<value>
- * Otherwise, env remains minimal (PATH, LANG/LC_CTYPE/CHARSET).
+ * Exit status
+ *   3               Refused or failed before exec (rg itself uses 0/1/2).
+ *   --kill          0 on success, 1 otherwise.
+ *   anything else   The tool's own exit status (safexec execs the tool, so
+ *                   its status is what the caller sees).
  *
- * Detach / isolation mode
- * -----------------------
- * SAFEXEC_DETACH=auto|cgv2|rlimits|off
- *    auto     : prefer cgroup v2; fall back to rlimits if unavailable.
- *    cgv2     : require cgroup v2; fail if not possible.
- *    rlimits  : skip cgroup; apply rlimits (+ optional nice/ionice).
- *    off      : no isolation tweaks.
- * On glibc builds, SAFEXEC_DETACH is read via secure_getenv(); on musl,
- * getenv() is used (musl does not provide secure_getenv()).
+ * Allowlist
+ *   Always available: rg, wget, curl; archives (tar, gzip, gunzip, xz, unxz,
+ *   zip, unzip); checksums (sha256sum, sha512sum, shasum, b2sum, cksum);
+ *   media (ffmpeg, ffprobe, magick, convert, identify); documents
+ *   (wkhtmltopdf, pdftk, pandoc). Optional buckets, enabled at compile time:
+ *     -DSAFEXEC_WITH_GS         gs
+ *     -DSAFEXEC_WITH_POPPLER    pdfinfo, pdftoppm, pdftocairo
+ *     -DSAFEXEC_WITH_DB         mysqldump, mysql, mariadb-dump, mariadb,
+ *                               pg_dump, pg_restore, psql, redis-cli
+ *     -DSAFEXEC_WITH_RSYNC_GIT  rsync, git
+ *   Prelude wrappers: nohup, nice, timeout, stdbuf, ionice, taskset, setsid,
+ *   chrt, time.
+ *   Other compile-time defaults: -DSAFEXEC_QUIET_DEFAULT=0|1 and
+ *   -DSAFEXEC_SAFE_CWD_DEFAULT=-1|0|1 (see Environment below).
  *
- * Other controls
- * --------------
- * SAFEXEC_QUIET=0|1            : suppress informational messages (default 0)
- * SAFEXEC_SAFE_CWD=-1|0|1      : if 1, chdir to /tmp (or /) when CWD is
- *                                inaccessible; if -1 (default), enable only
- *                                for interactive sessions (any stdio is a TTY).
+ * Installation
+ *   chown root:root safexec && chmod 4755 safexec
+ *   Do not place it on a nosuid mount; without the setuid bit safexec runs in
+ *   pass-through mode (see step 4 below).
  *
- * Behavior notes
- * --------------
- *  - If not installed setuid-root (or euid!=0 at runtime), safexec enters
- *    *pass-through* mode: it still enforces the allowlist and absolute-path
- *    pinning, but does not sanitize the environment, drop privileges, or apply
- *    isolation (no cgroups/rlimits/NNP).
- *  - A per-run cgroup name "nppp.<pid>" is used to avoid stale limits. Empty
- *    stale "nppp.*" groups may be cleaned up automatically.
- *  - Locale: attempts C.UTF-8 → en_US.UTF-8 → C; sets CHARSET to aid BusyBox wget.
- *  - When /tmp is not writable by the final euid and the command is wget with
- *    "-P /tmp", safexec rewrites the destination to "/tmp/nppp-cache/<euid>"
- *    if a safe, root-owned sticky parent exists ("/tmp/nppp-cache" is ensured
- *    root:root 01777). Otherwise it leaves "-P /tmp" untouched and warns.
- *  - Symlink note: on platforms without O_NOFOLLOW, open-time symlink protection
- *    is reduced (compile-time fallback).
+ * Execution model
+ *   1. Allowlist    The tool is matched by basename against the allowlist.
+ *                   Shells (sh, bash, dash, ash, zsh, ksh, fish) are rejected
+ *                   in the prelude. The prelude may hold wrapper names,
+ *                   options, signed integers and NAME=VALUE assignments;
+ *                   assignments are limited to proxy variables (HTTP_PROXY,
+ *                   HTTPS_PROXY, ALL_PROXY, NO_PROXY and their lower-case
+ *                   forms), and loader/interpreter knobs such as PATH, IFS,
+ *                   LD_*, DYLD_*, PYTHONPATH are refused.
+ *   2. Pinning      The tool and every bare-name wrapper are resolved to
+ *                   absolute paths under trusted bin dirs (/usr/bin, /bin,
+ *                   /usr/local/{bin,sbin}, /usr/sbin, /sbin, NixOS
+ *                   /run/current-system/sw/bin, pkgsrc /usr/pkg/{bin,sbin};
+ *                   Homebrew/MacPorts on macOS). A symlink is accepted only
+ *                   if its realpath is also trusted; the symlink path is what
+ *                   gets exec'd, so multi-call binaries (BusyBox, coreutils)
+ *                   keep the right argv[0]. Wrappers given with an explicit
+ *                   path must be exactly "<trusted dir>/<name>".
+ *   3. Setuid       With euid 0: clear the environment, set a fixed PATH and
+ *                   a UTF-8 locale, umask 077, PR_SET_DUMPABLE=0; join a
+ *                   cgroup v2 child <cgroup root>/safexec-run/safexec-run.<pid>
+ *                   or fall back to rlimits plus optional nice/ionice; drop
+ *                   privileges; PR_SET_NO_NEW_PRIVS; close fds >= 3; exec.
+ *                   The drop target is 'nobody', except for rg (below). If
+ *                   the drop fails, safexec falls back to the invoking user
+ *                   (real uid/gid) and aborts if euid is still 0. safexec
+ *                   never execs a tool as root.
+ *   4. Pass-through Without setuid root (euid != 0) only steps 1-2 apply: no
+ *                   environment sanitizing, privilege drop or isolation. The
+ *                   tool runs as the invoking user.
  *
- * Portability / features
- * ----------------------
- *  - Linux:   cgroup v2 join (under /sys/fs/cgroup/nppp), pidfd-based kill (when
- *             kernel supports it), ioprio (when available), rlimits, closefrom
- *             via /proc/self/fd, PR_SET_NO_NEW_PRIVS, PR_SET_DUMPABLE(0).
- *  - BSD/macOS/other POSIX: rlimits + FD closing; no cgroup/pidfd.
+ * Tool-specific behavior
+ *   rg      The last argument must be an absolute path to a directory that
+ *           is not a symlink and not root-owned. rg runs as that directory's
+ *           owner; if the owner is already the invoking user no drop is
+ *           needed.
+ *   wget    If /tmp is not writable by the final euid, "-P /tmp" is
+ *           rewritten to /tmp/safexec-work/<euid> (the parent directory is
+ *           root-owned with sticky mode 01777; the per-user subdirectory is
+ *           mode 0700).
+ *   --kill  Linux only. Sends SIGTERM if the target process is owned by
+ *           'nobody' and sits in a "safexec-run" cgroup; without cgroup
+ *           delegation, NoNewPrivs=1 is accepted instead. Uses
+ *           pidfd_send_signal when available, otherwise kill().
  *
- * Optional tool buckets (build-time)
- * ----------------------------------
- *  Enable extra allowlisted tools with:
- *    -DSAFEXEC_WITH_GS, -DSAFEXEC_WITH_POPPLER, -DSAFEXEC_WITH_DB, -DSAFEXEC_WITH_RSYNC_GIT
+ * Environment (read before the environment is cleared)
+ *   SAFEXEC_DETACH=auto|cgv2|rlimits|off   Isolation mode (default auto).
+ *                  Read with secure_getenv() on glibc, getenv() on musl.
+ *   SAFEXEC_QUIET=0|1                      Suppress info messages (0).
+ *   SAFEXEC_SAFE_CWD=-1|0|1                chdir to /tmp (or /) when the
+ *                  CWD is not writable; -1 = only if a stdio fd is a TTY (-1).
  *
- * Install (recommended)
- * ---------------------
- *   chown root:root safexec && chmod 4755 safexec   (avoid nosuid mounts)
- * Without setuid root, you only get pass-through mode (still allowlisted).
+ * Files and kernel objects used
+ *   <cgroup root>/safexec-run/            Base cgroup v2 parent (created).
+ *   <cgroup root>/safexec-run/safexec-run.<pid>   Per-run child cgroup;
+ *                                         empty stale ones are removed.
+ *   /tmp/safexec-work/                    Root-owned 01777 fallback parent
+ *                                         for wget's download directory.
  *
- * Limitations
- * -----------
- *  - Not a general-purpose sandbox: only constrains *this* child process and
- *    its descendants. It does not provide syscall-level filtering.
- *  - Only allowlisted tools may run; arbitrary commands/pipelines are rejected.
+ * Diagnostics
+ *   Informational, warning and error messages go to stderr and are
+ *   suppressed by SAFEXEC_QUIET=1.
  *
- * Copyright
- * ---------
- * (C) 2025 Hasan Calisir <hasan.calisir@psauxit.com>
- * Version: 1.9.6 (2025)
+ * Platforms
+ *   Linux gets the full feature set. Other POSIX systems get the allowlist,
+ *   pinning, rlimits and fd closing, but no cgroup, pidfd or --kill.
+ *
+ * Limits
+ *   Not a general-purpose sandbox. It constrains only the process it
+ *   launches (and its descendants), and only allowlisted tools may run.
+ *   The tool's own arguments are not filtered: options such as rg --pre or
+ *   wget --execute make those tools run programs or change files with the
+ *   drop target's privileges. Expose the setuid binary only to callers that
+ *   are trusted with that (e.g. via file mode/group ownership).
+ *
+ * Copyright (C) 2025-2026 Hasan Calisir <hasan.calisir@psauxit.com>
  */
-
 
 #define _GNU_SOURCE 1
 
@@ -170,6 +176,10 @@
 #define SAFEXEC_VERSION  "1.9.6"
 #define SAFEXEC_AUTHOR   "Hasan Calisir"
 
+// safexec-detected failure before exec; distinct from normal rg statuses 0/1/2.
+// Other tools may independently return 3. --kill retains its 0/1 contract.
+#define SAFEXEC_LAUNCH_FAIL 3
+
 // Safe DIR
 #ifndef SAFEXEC_SAFE_CWD_DEFAULT
 #define SAFEXEC_SAFE_CWD_DEFAULT (-1)
@@ -210,6 +220,7 @@
   #define SAFEXEC_SYNC_VCS_TOOLS
 #endif
 
+
 // Rebuild the final table including optional buckets
 static const char *const ALLOWED_BINS[] = {
     // Scan
@@ -234,6 +245,7 @@ static const char *const ALLOWED_BINS[] = {
     NULL
 };
 
+
 static int is_allowed_bin(const char *base) {
     for (size_t i = 0; ALLOWED_BINS[i]; ++i)
         if (strcmp(base, ALLOWED_BINS[i]) == 0) return 1;
@@ -256,8 +268,6 @@ static int env_quiet_enabled(void) {
 
 // Quiet-aware logging layer
 static int QUIET = 0;
-static int g_keep_fd = -1;   /* fd that must survive closefrom_safe() before exec (rg cache dir) */
-static int g_keep_fd2 = -1;  /* fd that must survive closefrom_safe() before exec (pctnorm .so, see is_secure_so_fd) */
 static int s_printf(const char *fmt, ...) {
     if (QUIET) return 0;
     va_list ap; va_start(ap, fmt);
@@ -275,53 +285,6 @@ static int s_fprintf(FILE *stream, const char *fmt, ...) {
 static void s_perror(const char *s) {
     if (!QUIET) perror(s);
 }
-
-static const char *const TRUSTED_LIB_ROOTS[] = {
-    "/usr/lib", "/lib", "/usr/lib64", "/lib64", NULL
-};
-
-static int has_trusted_root(const char *real) {
-    for (const char *const *p = TRUSTED_LIB_ROOTS; *p; ++p) {
-        size_t n = strlen(*p);
-        if (strncmp(real, *p, n) == 0 && (real[n] == '\0' || real[n] == '/'))
-            return 1;
-    }
-    return 0;
-}
-
-/*
- * Validate the pctnorm shared object at 'path' and, on success, return an
- * *open, already-validated* file descriptor referring to the exact object
- * that was checked — not merely a path string.
- *
- * Returns a valid, open fd (caller owns it and must keep it alive — see
- * g_keep_fd2) on success, or -1 on any validation failure (nothing left
- * open in that case).
- */
-static int is_secure_so_fd(const char *path) {
-    if (!path || !*path) return -1;
-
-    char real[PATH_MAX];
-    if (!realpath(path, real)) return -1;
-
-    if (!has_trusted_root(real)) return -1;
-
-    const char *base = strrchr(real, '/');
-    base = base ? base + 1 : real;
-    if (strcmp(base, "libnpp_norm.so") != 0) return -1;
-
-    int fd = open(real, O_RDONLY | O_NOFOLLOW);
-    if (fd < 0) return -1;
-
-    struct stat st;
-    int ok = (fstat(fd, &st) == 0) &&
-             S_ISREG(st.st_mode) &&
-             st.st_uid == 0 && st.st_gid == 0 &&
-             ((st.st_mode & 022) == 0);
-    if (!ok) { close(fd); return -1; }
-    return fd;
-}
-static char *dup_or_null(const char *s) { return s ? strdup(s) : NULL; }
 
 // snprintf wrapper that errors on truncation to quiet -Wformat-truncation
 static int safe_snprintf(char *dst, size_t dstsz, const char *fmt, ...) {
@@ -379,8 +342,8 @@ static void clearenv_portable(void) {
 #endif
 }
 
-// Check whether a given PID lives under /nppp or matches nppp.* in cgroup v2 path
-static int proc_in_nppp_cgroup(pid_t pid) {
+// Check whether a given PID lives under /safexec-run or matches safexec-run.* in cgroup v2 path
+static int proc_in_safexec_cgroup(pid_t pid) {
 #ifndef __linux__
     (void)pid; return 0;
 #else
@@ -392,7 +355,7 @@ static int proc_in_nppp_cgroup(pid_t pid) {
     while (fgets(line, sizeof line, f)) {
         if (strncmp(line, "0::", 3) != 0) continue;   /* v2 only */
         const char *p = line + 3;
-        if (strstr(p, "/nppp/") || strstr(p, "/nppp.")) { ok = 1; break; }
+        if (strstr(p, "/safexec-run/") || strstr(p, "/safexec-run.")) { ok = 1; break; }
     }
     fclose(f);
     return ok;
@@ -445,10 +408,10 @@ typedef struct {
     int nice_adj;                            // 0 => leave as-is
     int ioprio_class;                        // 0 => leave as-is; 1=RT,2=BE,3=IDLE
     int ioprio_data;                         // 0..7
-} nppp_limits;
+} safexec_limits;
 
-static nppp_limits nppp_default_limits(void) {
-    nppp_limits L = {
+static safexec_limits safexec_default_limits(void) {
+    safexec_limits L = {
         .mem_max_v2 = NULL,                  // v2: explicitly unlimited
         .pids_max = -1,                      // unlimited
         .cpu_weight_v2 = 0,                  // don't write -> kernel default (100)
@@ -567,7 +530,7 @@ static void cgv2_enable_controllers(void) {
     (void)cgv2_enable_one("+cpuset");
 }
 
-// Remove empty stale groups matching prefix (e.g., "nppp.")
+// Remove empty stale groups matching prefix (e.g., "safexec-run.")
 static void cgv2_cleanup_stale(const char *prefix) {
     const char *root = cgv2_root(); if (!root) return;
     DIR *d = opendir(root); if (!d) return;
@@ -668,7 +631,7 @@ static void report_summary(const char *abs_tool, const char *cgroup_hint) {
         SHOW("cpuset.mems","cpuset.mems");
         #undef SHOW
     } else {
-        s_fprintf(stderr, "Summary: cgroup=(none; rlimits in effect)\n");  
+        s_fprintf(stderr, "Summary: cgroup=(none; rlimits in effect)\n");
     }
 }
 
@@ -755,26 +718,26 @@ static void cgv2_try_rmdir_if_empty(const char *dir) {
     }
 }
 
-// Always use /sys/fs/cgroup/nppp as base parent
+// Always use <cgroup root>/safexec-run as base parent
 static int cgv2_root_base(char *out, size_t outsz) {
     const char *root = cgv2_root();
     if (!root) return -1;
-    if (safe_snprintf(out, outsz, "%s/%s", root, "nppp") != 0) return -1;
+    if (safe_snprintf(out, outsz, "%s/%s", root, "safexec-run") != 0) return -1;
     if (mkdir(out, 0755) != 0 && errno != EEXIST) return -1;
     return 0;
 }
 
-static int cgv2_join_group(const char *name, const nppp_limits *L) {
+static int cgv2_join_group(const char *name, const safexec_limits *L) {
     if (!cgv2_available()) return -1;
 
-    // Discover where we START (session/service subtree), and our TARGET parent (/sys/fs/cgroup/nppp)
+    // Discover where we START (session/service subtree), and our TARGET parent (<cgroup root>/safexec-run)
     char self_parent[PATH_MAX], parent[PATH_MAX];
     if (cgv2_self_dir(self_parent, sizeof self_parent) != 0) return -1;
     if (cgv2_root_base(parent, sizeof parent) != 0) return -1;
 
-    // Prune empty nppp.* both under the session subtree and our global parent
-    cgv2_cleanup_stale_at(self_parent, "nppp.");
-    cgv2_cleanup_stale_at(parent,      "nppp.");
+    // Prune empty safexec-run.* both under the session subtree and our global parent
+    cgv2_cleanup_stale_at(self_parent, "safexec-run.");
+    cgv2_cleanup_stale_at(parent,      "safexec-run.");
 
     // Enable controllers on the global parent when possible (ignore failures)
     int parent_threaded = cgv2_is_threaded(parent);
@@ -879,7 +842,7 @@ static int cgv2_join_group(const char *name, const nppp_limits *L) {
     return 0;
 }
 
-static void apply_rlimits_and_sched(const nppp_limits *L) {
+static void apply_rlimits_and_sched(const safexec_limits *L) {
     struct rlimit r;
 
     // Address space (portable: RLIMIT_AS or RLIMIT_VMEM)
@@ -984,7 +947,7 @@ static void print_version(void) {
     printf(
         "%s %s\n"
         "Copyright (C) 2025 %s.\n"
-        "Used by: NPP – Nginx Cache Purge Preload for WordPress.\n",
+        ,
         SAFEXEC_NAME, SAFEXEC_VERSION, SAFEXEC_AUTHOR
     );
 }
@@ -1117,6 +1080,7 @@ static int is_shell_name(const char *b) {
            strcmp(b, "fish") == 0;
 }
 
+
 static int is_wrapper_name(const char *b) {
     return strcmp(b, "nohup")   == 0 ||
            strcmp(b, "nice")    == 0 ||
@@ -1128,6 +1092,7 @@ static int is_wrapper_name(const char *b) {
            strcmp(b, "chrt")    == 0 ||
            strcmp(b, "time")    == 0;
 }
+
 
 // Return 1 if NAME=VALUE is allowed to appear in the prelude; 0 => reject.
 static int is_assignment_allowed(const char *s) {
@@ -1172,6 +1137,24 @@ static int is_assignment_allowed(const char *s) {
     return 0;
 }
 
+// Values used by timeout (5s, 1.5, 2m), taskset (0x3, 0,1, 0-3) and friends
+static int is_prelude_value(const char *s) {
+    if (!s || !*s) return 0;
+    const unsigned char *p = (const unsigned char *)s;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        if (!*p) return 0;
+        for (; *p; ++p)
+            if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')))
+                return 0;
+        return 1;
+    }
+    if (*p < '0' || *p > '9') return 0;
+    while (*p && ((*p >= '0' && *p <= '9') || *p == '.' || *p == ',' || *p == '-')) ++p;
+    if (!*p) return 1;
+    return (p[1] == '\0' && (*p == 's' || *p == 'm' || *p == 'h' || *p == 'd'));
+}
+
 // Find first allowed tool
 static int find_target_prog_index(int argc, char **argv) {
     int i = 1;
@@ -1192,10 +1175,15 @@ static int find_target_prog_index(int argc, char **argv) {
         if (is_wrapper_name(b)) {
             if (strchr(tok, '/') != NULL) {
                 /* Explicit path supplied — validate it is inside a trusted dir */
+                /* The path must be exactly "<trusted dir>/<name>": no extra path
+                 * components, so ".." or a symlinked directory inside a trusted
+                 * dir cannot redirect it, and no attacker-writable component
+                 * exists that could be swapped between this check and exec. */
                 int trusted = 0;
                 for (const char *const *d = TRUSTED_BIN_DIRS; *d; ++d) {
                     size_t n = strlen(*d);
-                    if (strncmp(tok, *d, n) == 0 && tok[n] == '/') {
+                    if (strncmp(tok, *d, n) == 0 && tok[n] == '/' &&
+                        strchr(tok + n + 1, '/') == NULL) {
                         trusted = 1; break;
                     }
                 }
@@ -1246,7 +1234,15 @@ static int find_target_prog_index(int argc, char **argv) {
             }
             continue;
         }
-        if (looks_like_option(tok))    continue;
+        if (looks_like_option(tok)) {
+            /* An option must never name a path: "timeout 5 -dir/prog" or
+             * "nice -- -dir/prog" would make the wrapper exec ./-dir/prog. */
+            if (strchr(tok, '/') != NULL) {
+                s_fprintf(stderr, "Info: rejecting path-like option before tool: '%s'\n", tok);
+                break;
+            }
+            continue;
+        }
         if (is_name_eq_value(tok)) {
             if (!is_assignment_allowed(tok)) {
                 s_fprintf(stderr, "Info: rejecting dangerous assignment before tool: '%s'\n", tok);
@@ -1255,6 +1251,7 @@ static int find_target_prog_index(int argc, char **argv) {
             continue;
         }
         if (is_signed_int(tok))        continue;
+        if (is_prelude_value(tok))     continue;
         break;
     }
     return i;
@@ -1302,54 +1299,57 @@ static void set_locale_utf8_best_effort(void) {
 }
 
 /*
- * Open the nginx cache directory and validate it in one shot via the open
- * fd (fstat, not lstat-then-later-use-by-path). The caller execs rg against
- * "/proc/self/fd/<this fd>" instead of the original path string, so the
- * directory rg actually scans is guaranteed to be the exact object we
- * validated here — there is no window between check and use for it to be
- * swapped out from under us.
+ * Resolve the UID that owns the scan target by lstat()-ing the path itself.
+ * This is the most reliable cross-environment method: the owner of the
+ * directory is, by definition, the user who can read it.
  *
- * O_DIRECTORY makes the kernel reject non-directories at open() time;
- * O_NOFOLLOW makes it reject a symlink at the final path component. Both
- * replace the separate lstat()/S_ISDIR()/S_ISLNK() checks the old path-based
- * version needed. Deliberately NOT O_CLOEXEC: this fd must still be open in
- * rg's own process image after execve() for /proc/self/fd/<n> to resolve.
+ *   Bare metal:  lstat(<dir>) returns the owner uid directly.
+ *   Containers:  when the directory is bind-mounted into the container,
+ *                lstat() still works and returns the owner uid.
  *
- * Returns an open fd (caller owns it) and sets *out_owner on success, or -1
- * on any validation failure.
+ * No /proc scan or service-configuration parsing is needed — the path owner
+ * IS the user who can read it. Returns (uid_t)-1 on any failure.
+ * Refuses symlinks (world-writable directories such as /tmp or /dev/shm
+ * are mode 1777; any local user could plant one).
+ * Refuses to return uid 0 (root) — we never run a tool as root, so a
+ * root-owned path is rejected.
  */
-static int open_and_verify_cache_dir(const char *cache_path, uid_t *out_owner) {
-    if (!cache_path || !*cache_path) return -1;
-
-    int fd = open(cache_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
-    if (fd < 0) {
-        s_fprintf(stderr,
-            "Error: safexec: open('%s') failed: %s\n", cache_path, strerror(errno));
-        return -1;
-    }
+static uid_t resolve_scan_path_owner(const char *scan_path) {
+    if (!scan_path || !*scan_path) return (uid_t)-1;
 
     struct stat st;
-    if (fstat(fd, &st) != 0) {
+    if (lstat(scan_path, &st) != 0) {
         s_fprintf(stderr,
-            "Error: safexec: fstat('%s') failed: %s\n", cache_path, strerror(errno));
-        close(fd);
-        return -1;
+            "Error: safexec: lstat('%s') failed: %s\n", scan_path, strerror(errno));
+        return (uid_t)-1;
+    }
+
+    /* Reject symlinks unconditionally */
+    if (S_ISLNK(st.st_mode)) {
+        s_fprintf(stderr,
+            "Error: safexec: '%s' is a symlink\n", scan_path);
+        return (uid_t)-1;
+    }
+
+    /* Must be a directory */
+    if (!S_ISDIR(st.st_mode)) {
+        s_fprintf(stderr,
+            "Error: safexec: '%s' is not a directory\n", scan_path);
+        return (uid_t)-1;
     }
 
     /* Refuse root — we cannot drop to root */
     if (st.st_uid == 0) {
         s_fprintf(stderr,
-            "Error: safexec: '%s' is owned by root\n", cache_path);
-        close(fd);
-        return -1;
+            "Error: safexec: '%s' is owned by root\n", scan_path);
+        return (uid_t)-1;
     }
 
     s_fprintf(stderr,
         "Info: safexec: '%s' owned by uid=%lu\n",
-        cache_path, (unsigned long)st.st_uid);
+        scan_path, (unsigned long)st.st_uid);
 
-    *out_owner = st.st_uid;
-    return fd;
+    return st.st_uid;
 }
 
 /*
@@ -1359,7 +1359,7 @@ static int open_and_verify_cache_dir(const char *cache_path, uid_t *out_owner) {
  *   safexec rg -m 1 --text ... '<pattern>' '<path>'
  *
  */
-static const char *find_rg_cache_path(int argc, char **argv, int prog_i) {
+static const char *find_rg_scan_path(int argc, char **argv, int prog_i) {
     if (argc <= prog_i + 1) return NULL;
 
     const char *last = argv[argc - 1];
@@ -1369,6 +1369,7 @@ static const char *find_rg_cache_path(int argc, char **argv, int prog_i) {
 
     return last;
 }
+
 
 // Sanitize environment & process state early
 static void sanitize_process_early(void) {
@@ -1381,28 +1382,13 @@ static void sanitize_process_early(void) {
 #endif
 }
 
-// Close all inherited fds >= lowfd, except keep_fd/keep_fd2 (if >= 0)
-static void closefrom_safe(int lowfd, int keep_fd, int keep_fd2) {
-#if defined(__linux__) && defined(__NR_close_range)
-    /* Fast path: one syscall closes the whole range (Linux 5.9+). No glibc
-     * wrapper required — call the raw syscall directly so this still works
-     * on glibc < 2.34. Falls through to the /proc scan on ENOSYS (older
-     * kernel) or any other failure. Skipped entirely when a fd must be
-     * preserved (keep_fd/keep_fd2 >= 0), since close_range() can't
-     * selectively skip a fd in the middle of the range. */
-    if (keep_fd < 0 && keep_fd2 < 0) {
-        if (syscall(__NR_close_range, (unsigned int)lowfd, ~0U, 0) == 0)
-            return;
-    }
-#endif
+// Close all inherited fds >= 3
+static void closefrom_safe(int lowfd) {
     DIR *d = opendir("/proc/self/fd");
     if (!d) {
         long max = sysconf(_SC_OPEN_MAX);
         if (max < 0 || max > 65536) max = 1024;
-        for (int fd = lowfd; fd < max; ++fd) {
-            if (fd == keep_fd || fd == keep_fd2) continue;
-            close(fd);
-        }
+        for (int fd = lowfd; fd < max; ++fd) close(fd);
         return;
     }
     int dirfdno = dirfd(d);
@@ -1412,50 +1398,50 @@ static void closefrom_safe(int lowfd, int keep_fd, int keep_fd2) {
         char *end = NULL;
         long fd = strtol(de->d_name, &end, 10);
         if (end && *end) continue;
-        if (fd >= lowfd && fd != dirfdno && fd != keep_fd && fd != keep_fd2) close((int)fd);
+        if (fd >= lowfd && fd != dirfdno) close((int)fd);
     }
     closedir(d);
 }
 
-// Pre-drop: ensure /tmp/nppp-cache exists always
-static int ensure_tmp_cache_root(void) {
+// Pre-drop: ensure /tmp/safexec-work exists always
+static int ensure_tmp_fallback_root(void) {
     struct stat st;
 
     if (lstat("/tmp", &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
 
     struct stat stc;
-    if (lstat("/tmp/nppp-cache", &stc) == 0) {
+    if (lstat("/tmp/safexec-work", &stc) == 0) {
         if (S_ISLNK(stc.st_mode)) return -1;
         if (!S_ISDIR(stc.st_mode)) return -1;
         if (stc.st_uid != 0 || stc.st_gid != 0) return -1;
-        if (chmod("/tmp/nppp-cache", 01777) != 0)
-            s_perror("chmod /tmp/nppp-cache");
-        if (chown("/tmp/nppp-cache", 0, 0) != 0)
-            s_perror("chown /tmp/nppp-cache");
+        if (chmod("/tmp/safexec-work", 01777) != 0)
+            s_perror("chmod /tmp/safexec-work");
+        if (chown("/tmp/safexec-work", 0, 0) != 0)
+            s_perror("chown /tmp/safexec-work");
         return 0;
     }
     if (errno != ENOENT) return -1;
 
-    if (mkdir("/tmp/nppp-cache", 0700) != 0) return -1;
-    if (chown("/tmp/nppp-cache", 0, 0) != 0)
-        s_perror("chown /tmp/nppp-cache");
-    if (chmod("/tmp/nppp-cache", 01777) != 0)
-        s_perror("chmod /tmp/nppp-cache");
-    if (lstat("/tmp/nppp-cache", &stc) != 0 || !S_ISDIR(stc.st_mode) ||
+    if (mkdir("/tmp/safexec-work", 0700) != 0) return -1;
+    if (chown("/tmp/safexec-work", 0, 0) != 0)
+        s_perror("chown /tmp/safexec-work");
+    if (chmod("/tmp/safexec-work", 01777) != 0)
+        s_perror("chmod /tmp/safexec-work");
+    if (lstat("/tmp/safexec-work", &stc) != 0 || !S_ISDIR(stc.st_mode) ||
         stc.st_uid != 0 || stc.st_gid != 0) return -1;
     return 0;
 }
 
-static int parent_cache_is_safe(void) {
+static int parent_fallback_is_safe(void) {
     struct stat pc;
-    if (lstat("/tmp/nppp-cache", &pc) != 0) return 0;
+    if (lstat("/tmp/safexec-work", &pc) != 0) return 0;
     if (S_ISLNK(pc.st_mode)) return 0;
     if (!S_ISDIR(pc.st_mode)) return 0;
     if (pc.st_uid != 0 || pc.st_gid != 0) return 0;
     return 1;
 }
 
-// Post-drop: /tmp isn't writable by the final euid, rewrite -P to /tmp/nppp-cache/<euid>
+// Post-drop: /tmp isn't writable by the final euid, rewrite -P to /tmp/safexec-work/<euid>
 static void fix_wget_tmp_if_tmp_blocked(int argc, char **argv) {
     if (argc < 2) return;
 
@@ -1467,13 +1453,13 @@ static void fix_wget_tmp_if_tmp_blocked(int argc, char **argv) {
         if (strcmp(argv[i], "-P") == 0 && strcmp(argv[i + 1], "/tmp") == 0) {
             if (access("/tmp", W_OK) == 0) return;
 
-            if (!parent_cache_is_safe() || access("/tmp/nppp-cache", W_OK) != 0) {
+            if (!parent_fallback_is_safe() || access("/tmp/safexec-work", W_OK) != 0) {
                 s_fprintf(stderr, "Warning: /tmp not writable. No safe fallback. Keeping '-P /tmp'.\n");
                 return;
             }
 
             char sub[PATH_MAX];
-            if (safe_snprintf(sub, sizeof sub, "/tmp/nppp-cache/%lu", (unsigned long)geteuid()) != 0) {
+            if (safe_snprintf(sub, sizeof sub, "/tmp/safexec-work/%lu", (unsigned long)geteuid()) != 0) {
                 s_fprintf(stderr, "Warning: failed to compose fallback path. Keeping '-P /tmp'.\n");
                 return;
             }
@@ -1556,7 +1542,7 @@ static int try_kill_mode(const char *arg) {
     }
 
     // inside Linux branch of try_kill_mode
-    if (!proc_in_nppp_cgroup(pid)) {
+    if (!proc_in_safexec_cgroup(pid)) {
         /* cgroup check failed — container may not allow cgroup delegation.
          * Fall back: accept kill if NoNewPrivs=1 (set by safexec before exec,
          * kernel-enforced one-way flag). /proc/pid/status is already open
@@ -1606,6 +1592,17 @@ static int try_kill_mode(const char *arg) {
 #endif
 }
 
+// Export allowed prelude NAME=VALUE assignments (already validated) into the environment
+static void apply_prelude_env(const char *const *kv, int n) {
+    for (int i = 0; i < n; ++i) {
+        char *dup = strdup(kv[i]);
+        if (!dup) continue;
+        char *eq = strchr(dup, '=');
+        if (eq) { *eq = '\0'; (void)setenv(dup, eq + 1, 1); }
+        free(dup);
+    }
+}
+
 int main(int argc, char *argv[]) {
     QUIET = env_quiet_enabled();
 
@@ -1618,7 +1615,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (argc < 2) { print_usage(argv[0]); return 1; }
+    if (argc < 2) { print_usage(argv[0]); return SAFEXEC_LAUNCH_FAIL; }
 
     if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
         print_usage(argv[0]);
@@ -1628,7 +1625,7 @@ int main(int argc, char *argv[]) {
     // Reject --kill without '=' (e.g., "--kill" or "--kill 123")
     if (strncmp(argv[1], "--kill", 6) == 0 && argv[1][6] != '=') {
         print_usage(argv[0]);
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
 
     {
@@ -1641,33 +1638,33 @@ int main(int argc, char *argv[]) {
     // From here, only "<program> [args...]" is allowed.
     if (argv[1][0] == '-' || is_all_digits(argv[1])) {
         print_usage(argv[0]);
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
 
-    // Enforce a tight allowlist (plugin only needs wget), handling "safexec nohup wget ..."
+    // Enforce the tool allowlist, handling preludes such as "safexec nohup wget ..."
     int prog_i = find_target_prog_index(argc, argv);
     if (prog_i >= argc) {
         print_usage(argv[0]);
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
     const char *prog_base = base_of(argv[prog_i]);
     if (!is_allowed_bin(prog_base)) {
         s_fprintf(stderr, "Error: '%s' is not allowed by safexec.\n", prog_base);
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
 
     // Resolve allowed tool to an absolute, trusted path and pin argv[prog_i]
     char abs_tool[PATH_MAX];
     if (find_in_trusted_path(prog_base, abs_tool, sizeof abs_tool) != 0) {
         s_fprintf(stderr, "Error: cannot resolve trusted path for '%s'\n", prog_base);
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
 
     /* Pin the argv token so wrappers (env/timeout/nice) exec the same path */
     argv[prog_i] = strdup(abs_tool);
     if (!argv[prog_i]) {
         s_fprintf(stderr, "Error: OOM while pinning tool path\n");
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
 
     s_fprintf(stderr, "Info: pinned tool '%s' -> '%s'\n", prog_base, abs_tool);
@@ -1685,14 +1682,38 @@ int main(int argc, char *argv[]) {
         if (find_in_trusted_path(wb, abs_wrapper, sizeof abs_wrapper) != 0) {
             s_fprintf(stderr,
                 "Error: cannot resolve trusted path for wrapper '%s'\n", wb);
-            return 1;
+            return SAFEXEC_LAUNCH_FAIL;
         }
         argv[wi] = strdup(abs_wrapper);
         if (!argv[wi]) {
             s_fprintf(stderr, "Error: OOM while pinning wrapper path\n");
-            return 1;
+            return SAFEXEC_LAUNCH_FAIL;
         }
         s_fprintf(stderr, "Info: pinned wrapper '%s' -> '%s'\n", wb, abs_wrapper);
+    }
+
+    /* Prelude NAME=VALUE assignments (proxy variables only): no allowed wrapper
+     * interprets them, so exec used to fail with ENOENT. Strip them from argv
+     * and export them for the exec'd chain instead. */
+    const char *prelude_env[16];
+    int n_prelude_env = 0;
+    {
+        int w = 1;
+        for (int r = 1; r < argc; ++r) {
+            if (r < prog_i && !is_wrapper_name(base_of(argv[r])) &&
+                !looks_like_option(argv[r]) && is_name_eq_value(argv[r])) {
+                if (n_prelude_env >= 16) {
+                    s_fprintf(stderr, "Error: too many environment assignments\n");
+                    return SAFEXEC_LAUNCH_FAIL;
+                }
+                prelude_env[n_prelude_env++] = argv[r];
+                continue;
+            }
+            argv[w++] = argv[r];
+        }
+        prog_i -= (argc - w);
+        argc = w;
+        argv[argc] = NULL;
     }
 
     // PASS-THROUGH MODE
@@ -1714,38 +1735,32 @@ int main(int argc, char *argv[]) {
             "Note: To enable hardening: chown root:root %s && chmod 4755 %s (avoid nosuid)\n",
             argv[0], argv[0]);
 
+        apply_prelude_env(prelude_env, n_prelude_env);
         execvp(argv[1], &argv[1]);
         s_perror("safexec: execvp");
-        _exit(1);
+        _exit(SAFEXEC_LAUNCH_FAIL);
     }
 
     // Read isolation preferences & limits
-    nppp_limits LIM = nppp_default_limits();
+    safexec_limits LIM = safexec_default_limits();
     enum detach_mode mode = parse_detach_mode();
-
-    // capture pctnorm prefs BEFORE we clear the env
-    int   pct_enable = env_flag("SAFEXEC_PCTNORM", 1);  // default ON
-    char *pct_so     = dup_or_null(getenv("SAFEXEC_PCTNORM_SO"));
-    char *pct_case   = dup_or_null(getenv("SAFEXEC_PCTNORM_CASE"));
-
-    #define FREE_PCT() do { free(pct_so); free(pct_case); pct_so=NULL; pct_case=NULL; } while (0)
 
     // Sanitize env and process state before any NSS/library lookups
     sanitize_process_early();
+    apply_prelude_env(prelude_env, n_prelude_env);
 
     int isolated = 0;
 
     // Fresh group name to avoid stale limits from previous runs
     char cgname[64];
-    if (safe_snprintf(cgname, sizeof cgname, "nppp.%ld", (long)getpid()) != 0) {
+    if (safe_snprintf(cgname, sizeof cgname, "safexec-run.%ld", (long)getpid()) != 0) {
         s_fprintf(stderr, "Error: failed to compose cgroup name\n");
-        FREE_PCT();
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
 
     // Cleanup empty stale groups first, enable controllers
     if (cgv2_available()) {
-        cgv2_cleanup_stale("nppp.");
+        cgv2_cleanup_stale("safexec-run.");
         cgv2_enable_controllers();
     }
 
@@ -1762,13 +1777,11 @@ int main(int argc, char *argv[]) {
                 isolated = 1;
             } else if (mode == DET_CGV2) {
                 s_fprintf(stderr, "Error: cgroup v2 requested but join failed\n");
-                FREE_PCT();
-                return 1;
+                return SAFEXEC_LAUNCH_FAIL;
             }
         } else if (mode == DET_CGV2) {
             s_fprintf(stderr, "Error: cgroup v2 requested but not available\n");
-            FREE_PCT();
-            return 1;
+            return SAFEXEC_LAUNCH_FAIL;
         }
     }
 
@@ -1779,8 +1792,8 @@ int main(int argc, char *argv[]) {
         isolated = 1;
     }
 
-    // Create /tmp/nppp-cache (01777) if possible, idempotent
-    (void)ensure_tmp_cache_root();
+    // Create /tmp/safexec-work (01777) if possible, idempotent
+    (void)ensure_tmp_fallback_root();
 
     // Remember original caller IDs for safe fallback
     uid_t ruid = getuid();
@@ -1788,67 +1801,42 @@ int main(int argc, char *argv[]) {
     int   was_root = (geteuid() == 0);
 
     /*
-     * For rg: resolve the target drop UID from the cache path's owner.
-     * This works in both monolithic and containerized deployments because
-     * the original nginx cache path is always accessible to root (us),
-     * and its owner uid is exactly the user rg needs to run as.
+     * For rg: resolve the target drop UID from the scan path's owner.
+     * This works on bare metal and in containers alike because the path
+     * is always accessible to root (us), and its owner uid is exactly the
+     * user rg needs to run as.
      *
      * For all other tools: drop to 'nobody' as usual.
      */
     struct passwd *pw = NULL;
 
     if (is_prog(argv[prog_i], "rg")) {
-        const char *rg_cache_path = find_rg_cache_path(argc, argv, prog_i);
-        uid_t cache_owner = (uid_t)-1;
-        int cache_fd = rg_cache_path
-            ? open_and_verify_cache_dir(rg_cache_path, &cache_owner)
-            : -1;
 
-        if (cache_fd < 0) {
+        const char *rg_scan_path = find_rg_scan_path(argc, argv, prog_i);
+        uid_t scan_owner = (rg_scan_path)
+            ? resolve_scan_path_owner(rg_scan_path)
+            : (uid_t)-1;
+
+        if (scan_owner == (uid_t)-1) {
             s_fprintf(stderr,
                 "Error: safexec: root-owned or invalid path; refusing exec\n");
-            FREE_PCT();
-            return 1;
+            return SAFEXEC_LAUNCH_FAIL;
         }
 
-        /*
-         * Rewrite rg's path argument to "/proc/self/fd/<n>" so rg scans the
-         * exact directory object we just validated, closing the TOCTOU gap
-         * between this check and the later execvp(). The fd must stay open
-         * (not CLOEXEC) and must be excluded from closefrom_safe() below;
-         * g_keep_fd carries it through to that point.
-         */
-        char fdpath[64];
-        if (safe_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", cache_fd) != 0) {
-            s_fprintf(stderr, "Error: safexec: failed to compose fd path\n");
-            close(cache_fd);
-            FREE_PCT();
-            return 1;
-        }
-        argv[argc - 1] = strdup(fdpath);
-        if (!argv[argc - 1]) {
-            s_fprintf(stderr, "Error: safexec: OOM while pinning cache fd path\n");
-            close(cache_fd);
-            FREE_PCT();
-            return 1;
-        }
-        g_keep_fd = cache_fd;
-
-        if (cache_owner == ruid) {
+        if (scan_owner == ruid) {
             s_fprintf(stderr,
                 "Info: safexec: path owner matches caller (uid=%lu); skipping drop\n",
                 (unsigned long)ruid);
-            goto drop_to_fpm_user;
+            goto drop_to_invoking_user;
         }
 
-        pw = getpwuid(cache_owner);
+
+        pw = getpwuid(scan_owner);
         if (!pw) {
             s_fprintf(stderr,
                 "Error: safexec: uid %lu not in passwd; refusing exec\n",
-                (unsigned long)cache_owner);
-            close(cache_fd);
-            FREE_PCT();
-            return 1;
+                (unsigned long)scan_owner);
+            return SAFEXEC_LAUNCH_FAIL;
         }
 
         s_fprintf(stderr,
@@ -1859,23 +1847,22 @@ int main(int argc, char *argv[]) {
     }
 
     if (pw) {
-        if (setgroups(0, NULL) != 0) { s_perror("setgroups (nobody)"); goto drop_to_fpm_user; }
-        if (setgid(pw->pw_gid) != 0) { s_perror("setgid (nobody)");    goto drop_to_fpm_user; }
-        if (setuid(pw->pw_uid) != 0) { s_perror("setuid (nobody)");    goto drop_to_fpm_user; }
+        if (setgroups(0, NULL) != 0) { s_perror("setgroups (nobody)"); goto drop_to_invoking_user; }
+        if (setgid(pw->pw_gid) != 0) { s_perror("setgid (nobody)");    goto drop_to_invoking_user; }
+        if (setuid(pw->pw_uid) != 0) { s_perror("setuid (nobody)");    goto drop_to_invoking_user; }
     } else {
         s_fprintf(stderr, "Warning: 'nobody' user not found, continuing as original user\n");
     }
 
-    // Ensure we never exec as root; if still euid==0, drop to FPM user
-    if (geteuid() == 0) { goto drop_to_fpm_user; }
+    // Ensure we never exec as root; if still euid==0, drop to the invoking user
+    if (geteuid() == 0) { goto drop_to_invoking_user; }
 
 post_drop:
 
     // Never, ever exec as root. If privilege drop didn’t stick, bail out.
     if (geteuid() == 0) {
         s_fprintf(stderr, "Fatal: safexec cannot be used as root; refusing to exec (privilege drop failed).\n");
-        FREE_PCT();
-        return 1;
+        return SAFEXEC_LAUNCH_FAIL;
     }
 
     // Safe DIR
@@ -1898,68 +1885,29 @@ post_drop:
     }
 #endif
 
-    /* LD_PRELOAD shim injection: only for wget/curl, only if possible. */
-    if (pct_enable && (is_prog(argv[prog_i], "wget") || is_prog(argv[prog_i], "curl"))) {
-        const char *so = pct_so ? pct_so : "/usr/lib/npp/libnpp_norm.so";
-        int so_fd = is_secure_so_fd(so);
-        if (so_fd >= 0) {
-            char fdpath[64];
-            if (safe_snprintf(fdpath, sizeof fdpath, "/proc/self/fd/%d", so_fd) != 0) {
-                s_fprintf(stderr, "Info: Not injecting LD_PRELOAD shim (fd path overflow)\n");
-                close(so_fd);
-            } else {
-                const char *case_val = (pct_case && *pct_case) ? pct_case : "upper";
-                /* Inject the FD-PINNED path, not the original 'so' string:
-                 * /proc/self/fd/<n> always refers to the specific,
-                 * already-validated inode, immune to the original path
-                 * being retargeted (symlink swap, rename, etc.) in the
-                 * window between validation and the dynamic linker's own
-                 * lookup at exec time. */
-                setenv("LD_PRELOAD", fdpath, 1);
-                setenv("PCTNORM_CASE", case_val, 1);
-                g_keep_fd2 = so_fd;  /* must survive closefrom_safe() and stay open across execve() */
-                s_fprintf(stderr,
-                          "Info: Injected: LD_PRELOAD=%s (validated:'%s') PCTNORM_CASE=%s (prog=%s)\n",
-                          fdpath, so, case_val, base_of(argv[prog_i]));
-            }
-        } else {
-            s_fprintf(stderr, "Info: Not injecting LD_PRELOAD shim (unsafe or missing so: %s)\n", so);
-        }
-    } else {
-        /* Make it explicit why we didn't inject, to aid debugging */
-        if (!pct_enable) {
-            s_fprintf(stderr, "Info: LD_PRELOAD shim disabled via SAFEXEC_PCTNORM=0\n");
-        } else {
-            s_fprintf(stderr, "Info: LD_PRELOAD shim not applicable (prog=%s)\n", base_of(argv[prog_i]));
-        }
-    }
-
     // Summary
     char selfcg[PATH_MAX] = {0};
     if (cgv2_self_dir(selfcg, sizeof selfcg) != 0) selfcg[0] = '\0';
      report_summary(abs_tool, selfcg);
 
-    // Close all inherited fds except stdio (and the pinned rg cache / pctnorm .so fd, if any) before exec
-    closefrom_safe(3, g_keep_fd, g_keep_fd2);
+    // Close all inherited fds except stdio before exec
+    closefrom_safe(3);
 
     fflush(NULL);
+
+
     execvp(argv[1], &argv[1]);
 
-    {
-        int saved = errno;
-        FREE_PCT();
-        errno = saved;
-        s_perror("safexec: execvp");
-        _exit(1);
-    }
+    s_perror("safexec: execvp");
+    _exit(SAFEXEC_LAUNCH_FAIL);
 
-drop_to_fpm_user:
+drop_to_invoking_user:
 
-    // Drop to original FPM user (ruid/rgid). If this fails, refuse to run.
+    // Drop to the invoking user (ruid/rgid). If this fails, refuse to run.
     if (was_root) {
-        if (setgroups(0, NULL) != 0) { s_perror("setgroups (fallback)"); FREE_PCT(); return 1; }
-        if (setgid(rgid) != 0)       { s_perror("setgid (fallback)");    FREE_PCT(); return 1; }
-        if (setuid(ruid) != 0)       { s_perror("setuid (fallback)");    FREE_PCT(); return 1; }
+        if (setgroups(0, NULL) != 0) { s_perror("setgroups (fallback)"); return SAFEXEC_LAUNCH_FAIL; }
+        if (setgid(rgid) != 0)       { s_perror("setgid (fallback)");    return SAFEXEC_LAUNCH_FAIL; }
+        if (setuid(ruid) != 0)       { s_perror("setuid (fallback)");    return SAFEXEC_LAUNCH_FAIL; }
     }
 
     // If not was_root, we’re already the caller; nothing to do
