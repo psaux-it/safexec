@@ -11,6 +11,12 @@
 
 set -u
 
+# safexec exits with SAFEXEC_LAUNCH_FAIL (3) for any failure it detects before
+# exec (usage, disallowed program, prelude rejection, unresolvable tool) so it
+# cannot be confused with rg's own 0/1/2. Only --kill keeps a 0/1 contract.
+# See SAFEXEC_LAUNCH_FAIL in safexec.c.
+EX_LAUNCH_FAIL=3
+
 # Predictable perms on anything we create below. This matters because
 # safexec's privilege-drop branch triggers on geteuid()==0 alone — it does
 # not check whether the binary is actually installed setuid-root. That means
@@ -113,10 +119,10 @@ contains() {
 # ---------------------------------------------------------------------------
 
 run_safexec
-if [ "$RC" -eq 1 ] && contains "$OUT$ERR" "Usage"; then
-    pass "no-args prints usage and exits 1"
+if [ "$RC" -eq "$EX_LAUNCH_FAIL" ] && contains "$OUT$ERR" "Usage"; then
+    pass "no-args prints usage and exits $EX_LAUNCH_FAIL"
 else
-    fail "no-args prints usage and exits 1" "rc=$RC out=[$OUT] err=[$ERR]"
+    fail "no-args prints usage and exits $EX_LAUNCH_FAIL" "rc=$RC out=[$OUT] err=[$ERR]"
 fi
 
 run_safexec --help
@@ -152,21 +158,21 @@ fi
 # ---------------------------------------------------------------------------
 
 run_safexec 123
-if [ "$RC" -eq 1 ]; then
+if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
     pass "purely-numeric first arg rejected"
 else
     fail "purely-numeric first arg rejected" "rc=$RC"
 fi
 
 run_safexec --bogus-flag
-if [ "$RC" -eq 1 ]; then
+if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
     pass "leading-dash first arg rejected"
 else
     fail "leading-dash first arg rejected" "rc=$RC"
 fi
 
 run_safexec --kill
-if [ "$RC" -eq 1 ]; then
+if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
     pass "--kill without '=' rejected"
 else
     fail "--kill without '=' rejected" "rc=$RC"
@@ -207,7 +213,7 @@ fi
 
 # `cat` is deliberately NOT in ALLOWED_BINS.
 run_safexec cat /etc/hostname
-if [ "$RC" -eq 1 ] && contains "$ERR" "not allowed"; then
+if [ "$RC" -eq "$EX_LAUNCH_FAIL" ] && contains "$ERR" "not allowed"; then
     pass "disallowed binary (cat) rejected"
 else
     fail "disallowed binary (cat) rejected" "rc=$RC err=[$ERR]"
@@ -215,7 +221,7 @@ fi
 
 # Shells must never be reachable as the *target* program.
 run_safexec sh -c 'echo pwned'
-if [ "$RC" -eq 1 ]; then
+if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
     pass "bare shell as target rejected"
 else
     fail "bare shell as target rejected" "rc=$RC out=[$OUT]"
@@ -224,7 +230,7 @@ fi
 # Shell must also be rejected when disguised ahead of an allowed tool.
 if have sha256sum; then
     run_safexec sh -c 'sha256sum /etc/hostname'
-    if [ "$RC" -eq 1 ]; then
+    if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
         pass "shell prelude before allowed tool rejected"
     else
         fail "shell prelude before allowed tool rejected" "rc=$RC out=[$OUT]"
@@ -242,14 +248,14 @@ if have sha256sum; then
 
     # Dangerous assignment before the tool must be rejected outright.
     run_safexec LD_PRELOAD=/tmp/whatever.so sha256sum "$WORKDIR/sample.txt"
-    if [ "$RC" -eq 1 ]; then
+    if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
         pass "dangerous env assignment (LD_PRELOAD=) in prelude rejected"
     else
         fail "dangerous env assignment (LD_PRELOAD=) in prelude rejected" "rc=$RC out=[$OUT]"
     fi
 
     run_safexec PATH=/tmp sha256sum "$WORKDIR/sample.txt"
-    if [ "$RC" -eq 1 ]; then
+    if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
         pass "dangerous env assignment (PATH=) in prelude rejected"
     else
         fail "dangerous env assignment (PATH=) in prelude rejected" "rc=$RC out=[$OUT]"
@@ -313,7 +319,7 @@ fi
 
 # Explicit wrapper path outside trusted dirs must be refused.
 run_safexec "$HIJACK_DIR/nohup" sha256sum "$WORKDIR/sample.txt" 2>/dev/null
-if [ "$RC" -eq 1 ]; then
+if [ "$RC" -eq "$EX_LAUNCH_FAIL" ]; then
     pass "explicit wrapper path outside trusted dirs rejected"
 else
     fail "explicit wrapper path outside trusted dirs rejected" "rc=$RC"
