@@ -215,9 +215,11 @@ memory or I/O. Resource ceilings are set in `safexec_default_limits()` in
 
 ## Build
 
-Requirements: a C compiler and `make`. Linux is fully supported. Other POSIX
-systems get the allowlist, pinning, rlimits and descriptor closing, without
-cgroups, `pidfd` or `--kill`.
+Requirements: a C compiler, `make` and `install`. Linux is fully supported.
+Other POSIX systems get the allowlist, pinning, rlimits and descriptor
+closing, without cgroups, `pidfd` or `--kill`. The Linux kernel headers
+(`linux-libc-dev`, `linux-headers`) are optional: without `<linux/ioprio.h>`
+the I/O priority support is compiled out.
 
 ```sh
 make                                  # build/safexec
@@ -225,16 +227,42 @@ make EXTRA_CPPFLAGS="-DSAFEXEC_WITH_POPPLER -DSAFEXEC_WITH_DB"
 make clean
 ```
 
-`CC`, `CFLAGS`, `CPPFLAGS`, `LDFLAGS`, `PREFIX` and `DESTDIR` are honored.
-The default flags build a PIE with stack protector, RELRO, `-z now`, and
-CET (x86) or BTI/PAC (aarch64) where available.
+`CC`, `CPPFLAGS`, `CFLAGS`, `LDFLAGS` and `LDLIBS` are honored, from the
+environment or the command line.
 
-Static musl builds require `zig cc`:
+If `CPPFLAGS`, `CFLAGS` and `LDFLAGS` are not set, hardened defaults are
+used: PIE, stack protector, stack-clash protection, RELRO, `-z now`,
+`_FORTIFY_SOURCE=2`, and CET (x86) or BTI/PAC (aarch64) when the compiler
+supports them for its target. If they are set, they replace these defaults.
+Only `-D_GNU_SOURCE`, `-fno-strict-overflow` and
+`-fno-delete-null-pointer-checks` are always added.
+
+### Cross compilation
+
+```sh
+make CC=aarch64-linux-gnu-gcc
+```
+
+Architecture-specific hardening options are probed with the selected
+compiler, not with the build host. `make check` runs the built binary and
+cannot be used in a cross build.
+
+### musl
+
+Build natively on a musl system (for example Alpine) with plain `make`, or
+with `make CC=musl-gcc` elsewhere.
+
+### Static release binaries
 
 ```sh
 make static            # build/safexec-x86_64-linux-musl
 make static-aarch64    # build/safexec-aarch64-linux-musl
 ```
+
+These require `zig cc` (`make ZIG="python3 -m ziglang" static` to use another
+invocation). They are intended for upstream releases, not for distribution
+packages. musl does not load NSS modules, so users provided by LDAP or SSSD
+are not resolved; this affects the `rg` owner drop.
 
 ## Install
 
@@ -244,13 +272,81 @@ sudo chown root:root /usr/local/sbin/safexec
 sudo chmod 4755 /usr/local/sbin/safexec
 ```
 
-`make install` installs the binary to `$(PREFIX)/sbin` and the manual page to
-`$(PREFIX)/share/man/man1`. Do not install on a `nosuid` mount. To limit who
-can invoke the binary, use mode `4750` with a dedicated group.
+`make install` installs the binary to `$(SBINDIR)` and the manual page to
+`$(MAN1DIR)`. It needs no root privileges and never changes ownership. Do not
+install on a `nosuid` mount. To limit who can invoke the binary, use mode
+`4750` with a dedicated group.
+
+| Variable   | Default                | Meaning                                    |
+|------------|------------------------|--------------------------------------------|
+| `DESTDIR`  | empty                  | Staging root                               |
+| `PREFIX`   | `/usr/local`           | Installation prefix                        |
+| `SBINDIR`  | `$(PREFIX)/sbin`       | Binary directory                           |
+| `DATADIR`  | `$(PREFIX)/share`      |                                            |
+| `MANDIR`   | `$(DATADIR)/man`       | Manual page root                           |
+| `MAN1DIR`  | `$(MANDIR)/man1`       | Section 1 directory                        |
+| `BINMODE`  | `0755`                 | Binary mode; `4755` for setuid             |
+| `BINOWN`   | unset                  | Passed to `install -o` when set            |
+| `BINGRP`   | unset                  | Passed to `install -g` when set            |
 
 ```sh
 sudo make uninstall
 ```
+
+## Packaging
+
+The default `make install` does not set the setuid bit, so that unprivileged
+package builds work. The package must set it, either with
+`make install BINMODE=4755` under `fakeroot`, or in the package metadata.
+Without it `safexec` runs in pass-through mode.
+
+Debian's `dh_fixperms` removes setuid bits, so restore the mode afterwards:
+
+```make
+override_dh_auto_install:
+	dh_auto_install -- PREFIX=/usr
+
+override_dh_fixperms:
+	dh_fixperms
+	chmod 4755 debian/safexec/usr/sbin/safexec
+```
+
+Arch Linux (`sbin` is a symlink to `bin`):
+
+```sh
+package() {
+	cd "$pkgname-$pkgver"
+	make DESTDIR="$pkgdir" PREFIX=/usr SBINDIR=/usr/bin BINMODE=4755 install
+}
+```
+
+Gentoo:
+
+```sh
+inherit toolchain-funcs
+
+src_compile() {
+	emake CC="$(tc-getCC)"
+}
+
+src_install() {
+	emake DESTDIR="${D}" PREFIX="${EPREFIX}/usr" install
+	fperms 4755 /usr/sbin/safexec
+}
+```
+
+Alpine (`makedepends="linux-headers"`):
+
+```sh
+package() {
+	make DESTDIR="$pkgdir" PREFIX=/usr BINMODE=4755 install
+}
+```
+
+`make check` runs `tests/run.sh`. It needs no root and skips the privilege
+drop test when not run as root against a setuid binary. Skip it when cross
+compiling. The end-to-end suite in `tests/run-all.sh` modifies the host and
+must not be run from a package build.
 
 ## Tests
 
