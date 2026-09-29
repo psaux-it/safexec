@@ -160,8 +160,10 @@
 #  define SAFEXEC_NO_PIDFD 1
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) && (!defined(__has_include) || __has_include(<linux/ioprio.h>))
 #include <linux/ioprio.h>
+#endif
+#ifdef __linux__
 #ifndef IOPRIO_WHO_PROCESS
 #define IOPRIO_WHO_PROCESS 1
 #endif
@@ -268,6 +270,7 @@ static int env_quiet_enabled(void) {
 
 // Quiet-aware logging layer
 static int QUIET = 0;
+static int s_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static int s_printf(const char *fmt, ...) {
     if (QUIET) return 0;
     va_list ap; va_start(ap, fmt);
@@ -275,6 +278,7 @@ static int s_printf(const char *fmt, ...) {
     va_end(ap);
     return r;
 }
+static int s_fprintf(FILE *stream, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static int s_fprintf(FILE *stream, const char *fmt, ...) {
     if (QUIET) return 0;
     va_list ap; va_start(ap, fmt);
@@ -287,6 +291,7 @@ static void s_perror(const char *s) {
 }
 
 // snprintf wrapper that errors on truncation to quiet -Wformat-truncation
+static int safe_snprintf(char *dst, size_t dstsz, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 static int safe_snprintf(char *dst, size_t dstsz, const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
