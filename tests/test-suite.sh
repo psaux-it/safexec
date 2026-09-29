@@ -4,8 +4,8 @@ SX=/usr/local/bin/safexec; SXF=/usr/local/bin/safexec-full; SXP=/usr/local/bin/s
 export SX SXF SXP
 AS=(setpriv --reuid=1001 --regid=1002 --clear-groups)
 IN=/srv/sxtest/in; OUTD=/srv/sxtest/out
-PASS=0; FAIL=0; FAILS=(); LOG=/home/claude/tests/log.txt; : > $LOG
-python3 /home/claude/tests/srv.py >/dev/null 2>&1 & SRV=$!
+PASS=0; FAIL=0; FAILS=(); LOG="${SXTEST_LOG:-/tmp/safexec-test-results/test-suite.log}"; mkdir -p "$(dirname "$LOG")"; : > "$LOG"
+python3 "$(dirname "$(readlink -f "$0")")/srv.py" >/dev/null 2>&1 & SRV=$!
 trap 'kill $SRV 2>/dev/null; pkill -f "ffmpeg.*testsrc" 2>/dev/null' EXIT
 sleep 1
 cd /srv/sxtest
@@ -51,6 +51,9 @@ T "reject id"                  3 'not allowed'  A $SX id
 T "reject env (not a wrapper)" 3 'not allowed'  A $SX env id
 T "reject nice bash"           3 'rejecting shell|not allowed' A $SX nice bash -c id
 T "reject timeout 5 sh"        3 'rejecting shell|not allowed' A $SX timeout 5 sh -c id
+# Pin the shell detector itself: the allowlist would also reject this, so the looser
+# 'not allowed|rejecting shell' patterns above cannot tell whether the detector still fires.
+T "shell before allowed tool: detector fires (defense in depth)" 3 'rejecting shell interpreter' A $SX sh -c 'sha256sum /srv/sxtest/in/hello.txt'
 T "reject python3"             3 'not allowed'  A $SX python3 -c 'print(1)'
 T "reject perl"                3 'not allowed'  A $SX perl -e 1
 T "reject PATH= assignment"    3 'dangerous assignment|not allowed' A $SX PATH=/tmp curl --version
@@ -274,4 +277,4 @@ T "rg + wrapper + assignment as alice"                0 'alice-secret' A $SX nic
 
 printf '\n==================== SUMMARY ====================\nPASS=%d FAIL=%d\n' $PASS $FAIL
 ((FAIL)) && printf 'FAILED: %s\n' "${FAILS[@]}"
-exit 0
+exit $((FAIL > 0))
