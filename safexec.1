@@ -1,57 +1,81 @@
 .\" SPDX-License-Identifier: GPL-2.0-only
-.\" Man page for safexec, part of NPP (Nginx Cache Purge Preload) for WordPress
-.TH SAFEXEC 1 "2025" "safexec 1.9.6" "User Commands"
+.\" Copyright (C) 2025-2026 Hasan Calisir <hasan.calisir@psauxit.com>
+.\"
+.\" Manual page for safexec 1.9.6.
+.\" Written from safexec.c, the Makefile, and the test suite.
+.\"
+.TH SAFEXEC 1 2026-09-29 "safexec 1.9.6"
 .SH NAME
-safexec \- secure privilege-dropping wrapper for controlled external command execution
+safexec \- run allowlisted tools with dropped privileges
 .SH SYNOPSIS
-.B safexec
-.RI [ wrapper " " args ...]
-.I program
-.RI [ args ... ]
-.br
-.B safexec
-.BI --kill= pid
-.br
-.B safexec
-.RB { --help | -h }
-.br
-.B safexec
-.RB { --version | -v }
+.SY safexec
+.RI [ wrapper " ...]"
+.I tool
+.RI [ argument " ...]"
+.YS
+.SY safexec
+.BI \-\-kill= pid
+.YS
+.SY safexec
+.BR \-\-help " | " \-h
+.YS
+.SY safexec
+.BR \-\-version " | " \-v
+.YS
 .SH DESCRIPTION
 .B safexec
-executes a restricted, compile-time allowlisted set of external programs
-(e.g.
-.BR wget (1),
-.BR curl (1))
-from higher-level contexts such as PHP. It is the privilege-dropping
-backend used by the NPP (Nginx Cache Purge Preload) WordPress plugin in
-place of a raw
-.B shell_exec()
-call.
-.PP
-When installed setuid-root,
+runs a fixed set of command-line tools
+on behalf of a less-trusted caller,
+such as a web application, a scheduler, or a job runner.
+It is intended to be installed set-user-ID root.
+For each request it performs these steps:
+.IP (1) 4
+The tool is matched by basename against a compile-time allowlist.
+.IP (2)
+The tool, and every wrapper given by bare name,
+is resolved to an absolute pathname
+under a fixed set of trusted directories.
+The caller's
+.B PATH
+and working directory are never consulted.
+.IP (3)
+When the effective user ID is 0,
+the environment is cleared,
+the process joins a new cgroup v2 group
+(or, failing that, has resource limits applied),
+and the process state is hardened.
+.IP (4)
+Privileges are dropped,
+the no-new-privileges flag is set,
+inherited file descriptors are closed,
+and the tool is executed.
+.P
 .B safexec
-sanitizes its environment, resolves the requested tool (and any leading
-wrapper commands) to absolute paths under trusted system directories,
-drops privileges before exec, and applies best-effort resource isolation
-(cgroup v2, or a POSIX rlimits fallback).
-.PP
-When the effective uid at runtime is not 0 (not installed setuid-root, or
-setuid bit lost/ignored, e.g. on a
-.B nosuid
-mount), it runs in
-.B pass-through mode
-instead: the allowlist and absolute-path pinning are still enforced, but
-environment sanitization, privilege dropping, resource isolation, and the
-percent-encoding normalization shim (see
-.B PCTNORM
-below) are all skipped, and the target is exec'd immediately as the
-original caller.
-.SH ALLOWED PROGRAMS
-Only the following compile-time allowlisted binaries may be executed
-(anything else is refused with a diagnostic on stderr):
-.TP
-.B Scan
+never starts a shell and never runs a tool as root.
+Arguments after the tool name reach the tool unchanged,
+so shell metacharacters in an argument are passed to the tool literally.
+Because
+.B safexec
+replaces itself with the tool,
+the process ID and the exit status seen by the caller
+are those of the tool.
+.SS Allowlist
+The tool is the first argument whose basename names an allowlisted program.
+Any directory part of that argument is discarded
+and the name is resolved again as described under
+.IR "Path pinning" ;
+for example,
+.I /tmp/evil/curl
+runs the trusted
+.BR curl (1)
+and never the file at that path.
+A program that is on the allowlist but not installed
+is refused with the message
+.IR "cannot resolve trusted path" .
+.P
+The following programs are always available:
+.TP 12
+.B Search
 .BR rg (1)
 .TP
 .B Fetch
@@ -74,7 +98,7 @@ Only the following compile-time allowlisted binaries may be executed
 .BR b2sum (1),
 .BR cksum (1)
 .TP
-.B Media / images
+.B Media
 .BR ffmpeg (1),
 .BR ffprobe (1),
 .BR magick (1),
@@ -85,33 +109,54 @@ Only the following compile-time allowlisted binaries may be executed
 .BR wkhtmltopdf (1),
 .BR pdftk (1),
 .BR pandoc (1)
-.PP
-The following buckets are compiled in only if the corresponding
-preprocessor macro was defined at build time (see
-.B OPTIONAL TOOL BUCKETS
-below):
-.BR gs ;
-.BR pdfinfo ,
-.BR pdftoppm ,
-.BR pdftocairo ;
-.BR mysqldump ,
-.BR mysql ,
-.BR mariadb-dump ,
-.BR mariadb ,
-.BR pg_dump ,
-.BR pg_restore ,
-.BR psql ,
-.BR redis-cli ;
-.BR rsync ,
-.BR git .
-.SH COMMAND PRELUDE
-Before the target program, a limited prelude of tokens may appear. Each
-token in
-.IR argv [1.. N -1]
-is scanned in order (up to the point where an allowed program name is
-recognized, which becomes the target) and must be one of:
+.P
+The following groups are added only when
+.B safexec
+is compiled with the corresponding macro
+(see
+.IR Building ):
 .TP
-.B A wrapper command
+.B SAFEXEC_WITH_GS
+.BR gs (1)
+.TP
+.B SAFEXEC_WITH_POPPLER
+.BR pdfinfo (1),
+.BR pdftoppm (1),
+.BR pdftocairo (1)
+.TP
+.B SAFEXEC_WITH_DB
+.BR mysqldump (1),
+.BR mysql (1),
+.BR mariadb\-dump (1),
+.BR mariadb (1),
+.BR pg_dump (1),
+.BR pg_restore (1),
+.BR psql (1),
+.BR redis\-cli (1)
+.TP
+.B SAFEXEC_WITH_RSYNC_GIT
+.BR rsync (1),
+.BR git (1)
+.P
+The shells
+.BR sh ,
+.BR bash ,
+.BR dash ,
+.BR ash ,
+.BR zsh ,
+.BR ksh ,
+and
+.B fish
+are never accepted, whether they appear before the tool or as the tool.
+.SS Prelude
+The arguments that precede the tool form the prelude.
+The prelude is scanned from left to right.
+Each argument must be one of the following;
+the first argument that is none of them ends the prelude,
+is taken to be the intended tool,
+and is refused unless it is allowlisted.
+.TP
+.B Wrapper
 One of
 .BR nohup ,
 .BR nice ,
@@ -121,57 +166,83 @@ One of
 .BR taskset ,
 .BR setsid ,
 .BR chrt ,
-.BR time .
-If given as a bare name, it is later resolved and pinned to an absolute
-path under a trusted directory, exactly like the target program. If given
-as an explicit path (containing
-.BR / ),
-that path is validated immediately: it must lie under a trusted binary
-directory, and if it is a symlink, its resolved target must also lie
-under a trusted directory \(em otherwise the whole prelude is rejected.
-.TP
-.B An option-looking token
-Any token beginning with
-.B -
-(or exactly
-.BR -- )
-is passed through unexamined (e.g.
-.B -n
-for
-.BR nice ,
-.B 30
-for
-.BR timeout ).
-.TP
-.B A signed integer
-A bare token consisting only of digits (optionally prefixed with
-.B +
 or
-.BR - )
-is passed through, to support numeric arguments to wrapper commands
-(e.g. the delay argument to
-.BR timeout ).
+.BR time .
+A bare name is resolved to a trusted pathname in the same way as the tool.
+An explicit pathname must consist of a trusted directory,
+a slash,
+and the wrapper name, with nothing in between.
+Thus
+.I /usr/bin/nice
+is accepted, while
+.IR /usr/bin/../bin/nice ,
+.IR /usr/bin/x/nice ,
+.IR ./nice ,
+and
+.I /tmp/nice
+are refused.
+The named file must be executable and must be either a regular file
+or a symbolic link whose real path is a regular file
+under a trusted directory.
 .TP
-.B A NAME=VALUE assignment
-Permitted only for a fixed proxy-related allowlist:
+.B Option
+An argument that begins with a hyphen and has at least one further character,
+or the argument
+.BR \-\- .
+Options are not interpreted, but an option that contains a slash is refused,
+so that a construct such as
+.I "timeout 5 \-dir/prog"
+cannot name a program.
+.TP
+.B Number or value
+A signed decimal integer;
+a hexadecimal number beginning with
+.BR 0x ;
+or a string that begins with a digit and continues with digits,
+periods, commas, and hyphens,
+optionally followed by one of the suffixes
+.BR s ,
+.BR m ,
+.BR h ,
+or
+.BR d .
+These forms cover durations
+.RB ( 5 ,
+.BR 1.5 ,
+.BR 2m )
+and CPU lists and masks
+.RB ( 0x3 ,
+.BR 0,1 ,
+.BR 0\-3 ).
+.IP
+Wrapper options that take their value as a separate word
+are not recognized unless that word has one of these forms.
+Write
+.IR "timeout \-sKILL 20" ,
+not
+.IR "timeout \-s KILL 20" .
+.TP
+.B Proxy assignment
+An argument of the form
+.IB NAME = VALUE
+where
+.I NAME
+is
 .BR HTTP_PROXY ,
 .BR HTTPS_PROXY ,
 .BR ALL_PROXY ,
-.BR NO_PROXY
-(and their lowercase equivalents). Any other assignment is rejected,
-including but not limited to
+.BR NO_PROXY ,
+or the lowercase form of one of these.
+At most 16 assignments are accepted.
+They may appear at any position in the prelude.
+Assignments are removed from the argument vector
+and exported to the environment of the tool.
+Every other assignment is refused,
+including
 .BR PATH ,
 .BR IFS ,
-.BR LD_PRELOAD ,
-.BR LD_AUDIT ,
-.BR LD_LIBRARY_PATH ,
-.BR LD_DEBUG ,
-.BR LD_ASSUME_KERNEL ,
-.BR LD_ORIGIN_PATH ,
-.BR LD_BIND_NOW ,
-any
-.BI DYLD_ *
-variable,
+.BR LD_* ,
+.BR DYLD_* ,
 .BR PYTHONPATH ,
 .BR PERL5OPT ,
 .BR RUBYOPT ,
@@ -180,440 +251,819 @@ variable,
 .BR GCONV_PATH ,
 .BR LOCPATH ,
 .BR TZDIR ,
-and
-.BR MALLOC_CONF .
-Unrecognized assignments are rejected by default.
-.PP
-A shell interpreter
-.RB ( sh ", " bash ", " dash ", " ash ", " zsh ", " ksh ", " fish )
-appearing anywhere in the prelude is explicitly rejected (e.g.
-.B "safexec sh -c ..."
-or
-.BR "safexec /bin/sh ..." ),
-regardless of any later allowed tool name in the argument list. Any other
-unrecognized token ends the prelude scan at that point; if the token is
-not itself an allowed program name, execution is refused.
-.SH SECURITY MODEL
-.TP
-.B Absolute-path pinning
-The target program (and any bare-name wrapper commands preceding it) is
-resolved to an absolute path under a trusted directory \(em
-.IR /usr/bin ", " /bin ", " /usr/local/bin ", " /usr/sbin ", " /sbin ,
-.IR /usr/local/sbin ", " /run/current-system/sw/bin ", " /usr/pkg/bin ,
-.I /usr/pkg/sbin
-(NetBSD pkgsrc), and on macOS also
-.IR /opt/homebrew/bin ", " /opt/homebrew/sbin ", " /opt/local/bin ,
-.I /opt/local/sbin
-\(em before exec. Regular files are accepted directly. Symlinks are
-followed only when the resolved target still lives under a trusted
-directory (this covers Alpine/BusyBox multi-call binaries such as
-.B nohup
-symlinked to
-.BR coreutils );
-the symlink path itself, not the resolved path, is what gets exec'd, so
-the kernel sets
-.B argv[0]
-correctly for multi-call binaries. If no trusted candidate is found,
-execution is refused.
-.TP
-.B Never exec as root
-The target is never exec'd as root. Privileges are dropped to the
-.B nobody
-user before exec (except for
-.BR rg ,
-see
-.B "RG-SPECIFIC BEHAVIOR"
-below); if the drop fails, safexec falls back to the original caller's
-uid/gid (e.g. the PHP-FPM worker's). If the effective uid is still 0 at
-any point before exec, safexec aborts rather than proceed.
-.TP
-.B Environment sanitization
-The environment is fully cleared early, then a minimal
-.BR PATH ,
-.BR LANG / LC_CTYPE / CHARSET
-are set. The process umask is forced to
-.B 077
-and core dumps are disabled via
-.BR PR_SET_DUMPABLE (0)
-(Linux). Immediately before exec,
-.B PR_SET_NO_NEW_PRIVS
-is set to prevent the child from regaining privileges.
-.TP
-.B File descriptor hygiene
-All inherited file descriptors numbered 3 and above are closed before
-exec (via a single
-.B close_range()
-syscall on Linux 5.9+, falling back to scanning
-.I /proc/self/fd
-otherwise), except for any file descriptor
-.B safexec
-itself opened and validated for the exec (the
-.B rg
-cache directory fd, or the pctnorm shared-object fd), which must survive
-into the child.
-.TP
-.B Resource isolation (Linux)
-The process is moved into its own cgroup v2 child, named
-.BI nppp. pid ,
-always created under
-.IR /sys/fs/cgroup/nppp ,
-regardless of the session/service cgroup subtree the caller started in.
-Relevant controllers
-.RI ( memory ", " pids ", " cpu ", " io ", " cpuset )
-are enabled on that parent where possible, and
-.B cpuset.cpus
-/
-.B cpuset.mems
-are propagated from parent to child when the child does not already set
-them. Threaded cgroup subtrees are handled by moving the calling thread
-into
-.I cgroup.threads
-and marking the child cgroup
-.B threaded
-when required. If cgroup v2 is unavailable, isolation falls back to
-POSIX rlimits (with optional nice/ionice adjustments, unused by default).
-.SH RG-SPECIFIC BEHAVIOR
-Unlike every other allowed program,
-.B rg
-(ripgrep) does not drop privileges to
-.BR nobody .
-Instead:
-.IP \(bu 3
-The last command-line argument is assumed to be an absolute path to the
-Nginx cache directory being scanned. It is opened directly with
-.B O_DIRECTORY|O_NOFOLLOW
-and validated via the resulting file descriptor (not by path, avoiding a
-check/use race). A directory owned by
-.B root
-is always refused.
-.IP \(bu 3
-The path argument passed to
-.B rg
-is rewritten to
-.BI /proc/self/fd/ n ,
-referring to the exact, already-validated directory file descriptor, so
-the directory
-.B rg
-actually scans cannot be swapped out between the validation check and
-exec.
-.IP \(bu 3
-If the cache directory's owner uid matches the original caller's real
-uid,
-.B safexec
-skips the privilege drop entirely and continues as the original caller.
-.IP \(bu 3
-Otherwise, safexec drops to the uid that owns the cache directory (which
-must resolve to a valid
-.I passwd
-entry), not to
-.BR nobody .
-If that uid cannot be resolved, execution is refused.
-.SH KILL MODE
-.BI --kill= pid
-terminates a process previously started by
-.BR safexec .
-The request succeeds only if both conditions hold:
-.IP \(bu 3
-The target process's real uid, read from
-.IR /proc/ pid /status ,
-matches the resolved uid of
-.BR nobody .
-.IP \(bu 3
-The target process belongs to an
-.BI nppp. *
-safexec cgroup, per
-.IR /proc/ pid /cgroup .
-.PP
-If the cgroup check fails (for example, in a container without cgroup
-delegation),
-.B safexec
-falls back to checking the target's
-.B NoNewPrivs
-flag in
-.IR /proc/ pid /status :
-if it is set, the kill proceeds anyway (since
-.B safexec
-itself sets this flag on every child it starts); if not set, the kill is
-refused.
-.PP
-Where the kernel supports it,
-.BR pidfd_open (2)
-/
-.BR pidfd_send_signal (2)
-are used to avoid PID-reuse race conditions; otherwise plain
-.BR kill (2)
-with
-.B SIGTERM
-is used as a fallback. This mode is Linux-only.
-.SH PERCENT-ENCODING NORMALIZATION (PCTNORM)
-When enabled
-.RI ( "and only in privileged mode \(em never in pass-through mode" ),
-.B safexec
-can normalize percent-encoded characters in URLs passed to
-.B wget
-or
-.B curl
-by preloading a shared object via
-.BR LD_PRELOAD .
-Controlled by:
-.TP
-.B SAFEXEC_PCTNORM=1|0
-Enable or disable the shim. Default: enabled
-.RB ( 1 ).
-.TP
-.B SAFEXEC_PCTNORM_SO=/path/to/libnpp_norm.so
-Path to the shim shared object. Default:
-.IR /usr/lib/npp/libnpp_norm.so .
-.TP
-.B SAFEXEC_PCTNORM_CASE=upper|lower|off
-Case normalization mode. Default:
-.BR upper .
-.PP
-The shared object is only ever injected for
-.B wget
-or
-.B curl
-invocations, and only after validation: it must resolve (via
-.BR realpath (3))
-to a regular file located beneath a trusted library root
-.RI ( /usr/lib ", " /lib ", " /usr/lib64 ", " /lib64 ),
-owned by
-.IR root:root ,
-not group- or other-writable, and named exactly
-.IR libnpp_norm.so .
-The file is opened and validated once; on success,
-.B LD_PRELOAD
-is set to a
-.I /proc/self/fd
-reference to that already-open, already-checked descriptor \(em not the
-original path string \(em so the object cannot be swapped out between
-validation and the dynamic linker's own lookup at exec time. If
-validation fails for any reason, the shim is silently skipped (a
-diagnostic is still printed to stderr) and the environment remains
-minimal.
-.SH ENVIRONMENT
-.TP
-.BI SAFEXEC_DETACH= mode
-Selects the isolation strategy.
-.I mode
-is one of:
-.RS
-.TP
-.B auto
-(default) Prefer cgroup v2; fall back to rlimits if unavailable.
-.TP
-.B cgv2
-Require cgroup v2; fail if it cannot be established.
-.TP
-.B rlimits
-Skip cgroups; apply rlimits (and optional nice/ionice) only.
-.TP
-.B off
-Apply no isolation tweaks at all.
-.RE
+.BR MALLOC_CONF ,
+and any unknown name.
+.SS Path pinning
+The tool and each bare-name wrapper are looked up in the following
+trusted directories, in this order:
 .IP
-Read via
-.BR secure_getenv (3)
-on glibc builds, or plain
-.BR getenv (3)
-on musl (which does not provide
-.BR secure_getenv ).
-.TP
-.B SAFEXEC_QUIET=0|1
-Suppress informational messages. Default:
-.BR 0 .
-.TP
-.BI SAFEXEC_SAFE_CWD= mode
-.BR -1 ,
-.BR 0 ,
-or
-.BR 1 .
-If
-.BR 1 ,
-.B safexec
-changes to
-.I /tmp
-(or
-.I /
-as a last resort) when the current working directory is inaccessible. If
-.B -1
-(default), this is enabled only for interactive sessions (any of
-stdin/stdout/stderr attached to a TTY).
-.TP
-.B SAFEXEC_PCTNORM, SAFEXEC_PCTNORM_SO, SAFEXEC_PCTNORM_CASE
-See
-.B "PERCENT-ENCODING NORMALIZATION (PCTNORM)"
-above.
-.SH BEHAVIOR NOTES
-.IP \(bu 3
-A fresh per-run cgroup name
-.RI ( nppp. pid )
-is used on every invocation. Empty, stale
-.BI nppp. *
-cgroups (in both the session/service subtree and the global
-.I /sys/fs/cgroup/nppp
-parent) are cleaned up automatically at the start of each run.
-.IP \(bu 3
-Locale selection is attempted in order:
-.BR C.UTF-8 ,
-then
-.BR en_US.UTF-8 ,
-then
-.BR C .
-.B CHARSET
-is also set to aid BusyBox
-.BR wget .
-.IP \(bu 3
-If
-.I /tmp
-is not writable by the final effective uid and the command being run is
-.B wget
-with exactly
-.B "-P /tmp"
-as adjacent arguments,
-.B safexec
-rewrites the destination to
-.IR /tmp/nppp-cache/ euid ,
-provided the parent directory
-.I /tmp/nppp-cache
-is root-owned, mode
-.BR 01777 ,
-and not a symlink (safexec ensures this directory exists on every
-privileged run). Otherwise the original
-.B "-P /tmp"
-argument is left untouched and a warning is printed.
-.IP \(bu 3
-On platforms lacking
-.BR O_NOFOLLOW ,
-open-time symlink protection is compiled out (reduced at build time).
-.SH PORTABILITY
-On Linux,
-.B safexec
-supports cgroup v2 joining, pidfd-based process termination where the
-kernel provides it, I/O priority adjustment, POSIX rlimits, single-syscall
-file-descriptor closing via
-.BR close_range (2)
-(with a
-.I /proc/self/fd
-scan fallback),
-.BR PR_SET_NO_NEW_PRIVS ,
+.I /usr/bin
+.br
+.I /bin
+.br
+.I /usr/local/bin
+.br
+.I /usr/sbin
+.br
+.I /sbin
+.br
+.I /usr/local/sbin
+.br
+.I /run/current-system/sw/bin
+.br
+.I /usr/pkg/bin
+.br
+.I /usr/pkg/sbin
+.P
+On macOS,
+.IR /opt/homebrew/bin ,
+.IR /opt/homebrew/sbin ,
+.IR /opt/local/bin ,
 and
-.BR PR_SET_DUMPABLE (0).
-.PP
-On BSD, macOS, and other POSIX systems, only rlimits and file-descriptor
-closing are applied; cgroup and pidfd support are Linux-only, and
-.B --kill
-is refused outright on non-Linux systems.
-.SH OPTIONAL TOOL BUCKETS (BUILD-TIME)
-Additional allowlisted tools may be compiled in via preprocessor defines,
-combined as needed:
-.TP
-.B -DSAFEXEC_WITH_GS
-Adds
-.BR gs (1)
-(Ghostscript) for PostScript/PDF rasterization. Off by default:
-Ghostscript has a long history of sandbox-escape and RCE CVEs via
-crafted PS/PDF input. Enable only if PS/PDF rasterization is specifically
-required and this exposure is understood.
-.TP
-.B -DSAFEXEC_WITH_POPPLER
-Adds
-.BR pdfinfo (1),
-.BR pdftoppm (1),
-.BR pdftocairo (1).
-.TP
-.B -DSAFEXEC_WITH_DB
-Adds database client/dump tools:
-.BR mysqldump ,
-.BR mysql ,
-.BR mariadb-dump ,
-.BR mariadb ,
+.I /opt/local/sbin
+are also trusted.
+The first directory that holds an executable candidate wins.
+.P
+A regular file is accepted directly.
+A symbolic link is accepted only if its real path is an executable regular file
+that itself lies under a trusted directory.
+In that case the pathname of the link, not the real path, is executed,
+so that multi-call binaries such as BusyBox and coreutils
+receive the correct
+.IR argv[0] .
+A link that resolves outside the trusted directories is skipped
+and the search continues.
+For example, on Debian
 .BR pg_dump ,
 .BR pg_restore ,
-.BR psql ,
-.BR redis-cli .
-Enable only where intended.
-.TP
-.B -DSAFEXEC_WITH_RSYNC_GIT
-Adds
-.BR rsync (1)
 and
-.BR git (1).
-Both can indirectly invoke
-.BR ssh (1)
-(via
-.B "rsync -e"
-or
-.B git+ssh://
-remotes), which escapes the allowlist's assumption of a closed set of
-non-networked, no-shell-out tools. Enable only if you control how these
-binaries are invoked.
-.SH INSTALLATION
-It is recommended to install
+.B psql
+are links to
+.IR \%/usr/share/postgresql\-common/pg_wrapper ,
+which is outside the trusted directories,
+so they are refused.
+.P
+Trust is decided by location only.
 .B safexec
-setuid-root:
-.PP
-.RS
-.nf
-chown root:root safexec
-chmod 4755 safexec
-.fi
-.RE
-.PP
-Ensure the install location is not on a
+does not check the owner or mode of the resolved file.
+.SS Privileged mode
+Privileged mode applies whenever the effective user ID is 0:
+when the binary is installed set-user-ID root,
+and also when it is run by root.
+In this mode
+.B safexec
+performs the following steps in order:
+.IP (1) 5
+The environment is cleared and rebuilt as described under
+.IR "Environment of the tool" .
+Proxy assignments from the prelude are then exported.
+.IP (2)
+The umask is set to 077 and the process is marked non-dumpable
+.RB ( PR_SET_DUMPABLE
+set to 0).
+.IP (3)
+The tool is isolated (see
+.IR Isolation ).
+.IP (4)
+The target user is chosen:
+.B nobody
+for every tool except
+.BR rg ,
+and the owner of the searched directory for
+.B rg
+(see
+.IR rg ).
+.IP (5)
+Supplementary groups are cleared,
+and the group ID and user ID are set to those of the target user.
+.IP (6)
+If the drop fails,
+or if the user
+.B nobody
+does not exist,
+.B safexec
+falls back to the real user ID and group ID of the caller,
+again with supplementary groups cleared.
+If the effective user ID is still 0 after that,
+.B safexec
+prints a fatal error and exits with status 3.
+A tool is never executed as root.
+.IP (7)
+The working directory is checked
+(see
+.BR SAFEXEC_SAFE_CWD ),
+and the
+.B wget
+directory argument is rewritten if necessary (see
+.IR wget ).
+.IP (8)
+On Linux,
+.B PR_SET_NO_NEW_PRIVS
+is set.
+.IP (9)
+A summary is written to standard error (see
+.IR Diagnostics ).
+.IP (10)
+All file descriptors above 2 are closed.
+.IP (11)
+The tool is executed.
+.SS Pass-through mode
+When the effective user ID is not 0,
+because the binary lacks the set-user-ID bit,
+resides on a
 .B nosuid
--mounted filesystem, or the setuid bit will be ignored by the kernel and
+filesystem,
+or was copied without its mode,
+only the allowlist, the prelude checks, and path pinning apply.
+The tool is then executed as the invoking user.
+The environment is not sanitized,
+privileges are not changed,
+no isolation is set up,
+no-new-privileges is not set,
+inherited file descriptors stay open,
+and the checks specific to
+.B rg
+and
+.B wget
+are not performed.
+Proxy assignments from the prelude are still exported,
+and
+.B SAFEXEC_SAFE_CWD
+is still honored.
+A notice is written to standard error.
+.SS Environment of the tool
+In privileged mode the caller's environment is discarded completely.
+The tool receives only:
+.TP
+.B PATH
+.I \%/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current\-system/sw/bin
+.TP
+.BR LANG ", " LC_CTYPE
+.B C.UTF\-8
+if that locale can be selected,
+otherwise
+.BR en_US.UTF\-8 ,
+otherwise
+.BR C .
+.TP
+.B CHARSET
+.B UTF\-8
+for the two UTF-8 locales,
+.B ASCII
+for
+.BR C .
+.TP
+Proxy variables
+Those given as proxy assignments in the prelude.
+.P
+In pass-through mode the tool inherits the caller's environment,
+plus any proxy assignments.
+.SS Isolation
+In privileged mode
 .B safexec
-will silently run in pass-through mode on every invocation.
+isolates the tool before it drops privileges.
+The method is selected by
+.BR SAFEXEC_DETACH .
+.P
+With cgroup v2,
+the process is moved into a new group named
+.BI safexec\-run. pid
+below
+.IR "<cgroup root>" /safexec\-run,
+which is created if necessary.
+.I <cgroup root>
+is
+.I /sys/fs/cgroup
+if
+.I cgroup.controllers
+is readable there,
+otherwise
+.IR /sys/fs/cgroup/unified .
+The controllers
+.BR memory ,
+.BR pids ,
+.BR cpu ,
+.BR io ,
+and
+.B cpuset
+are enabled where the kernel permits.
+Failure to enable a controller is not an error.
+Because the group is created by the process that then becomes the tool,
+.B safexec
+cannot remove it on exit;
+empty groups are removed by later invocations.
+.P
+With the rlimits fallback,
+.B safexec
+applies resource limits for address space, CPU time, open files,
+and process count,
+and optionally adjusts the nice value and I/O priority.
+.P
+The limits are compiled in
+(see
+.B safexec_default_limits()
+in the source).
+As shipped, none of them imposes a ceiling,
+so isolation groups and tracks the tool process
+but does not restrict its CPU, memory, or I/O use
+unless the source is modified and rebuilt.
+.SS rg
+In privileged mode
+.BR rg (1)
+runs as the owner of the directory it searches,
+so that it can read exactly what that user can read.
+The last argument is examined.
+It must:
+.IP \[bu] 3
+begin with a slash;
+.IP \[bu]
+name a directory that is not a symbolic link; and
+.IP \[bu]
+name a directory that is not owned by root.
+.P
+If the owner is the invoking user,
+the tool runs as that user,
+with the real user ID and real group ID of the caller
+and supplementary groups cleared.
+Otherwise the owner must exist in the password database,
+and
+.B safexec
+sets the user ID and the primary group ID of that user,
+with supplementary groups cleared.
+If any condition fails,
+.B safexec
+exits with status 3.
+.P
+Only the last argument is examined,
+and only in privileged mode.
+.SS wget
+If the arguments contain
+.B \-P
+followed by
+.I /tmp
+as two separate arguments,
+and
+.I /tmp
+is not writable by the user the tool will run as,
+the second argument is replaced by
+.IR /tmp/safexec\-work/ uid ,
+where
+.I uid
+is the effective user ID.
+Forms such as
+.B \-P/tmp
+and
+.B \-\-directory\-prefix=/tmp
+are not rewritten.
+.P
+In privileged mode
+.B safexec
+creates
+.I /tmp/safexec\-work
+if it does not exist,
+owned by root with mode 1777.
+If it already exists it must be a directory,
+not a symbolic link,
+and owned by root,
+or the fallback is not used.
+The per-user subdirectory is created with mode 0700
+and must belong to the target user.
+If any of these conditions cannot be met,
+.B safexec
+prints a warning and leaves
+.B \-P /tmp
+unchanged.
+.SS Kill mode
+.B safexec \-\-kill=\c
+.I pid
+sends
+.B SIGTERM
+to a process that
+.B safexec
+started.
+The request is refused with exit status 1 unless all of the following hold:
+.IP \[bu] 3
+.I pid
+is a decimal number from 1 to
+.BR INT_MAX ;
+.IP \[bu]
+the process exists;
+.IP \[bu]
+the process belongs to the user
+.BR nobody ;
+and
+.IP \[bu]
+the process is in a
+.I safexec\-run
+cgroup or, when it is not (for example, where cgroup delegation
+is unavailable),
+has
+.B NoNewPrivs
+set to 1 in
+.IR /proc/ pid /status .
+.P
+The signal is sent with
+.BR pidfd_send_signal (2)
+when available, which avoids PID reuse races,
+and with
+.BR kill (2)
+otherwise.
+On success
+.B safexec
+prints
+.B Success: Killed PID
+.I pid
+to standard output and exits with status 0.
+.P
+A process that
+.B safexec
+started for
+.BR rg ,
+or that fell back to the invoking user,
+does not belong to
+.B nobody
+and so cannot be stopped this way.
+A process owned by
+.B nobody
+can be signaled only by a privileged sender,
+so
+.B \-\-kill
+must be used through the set-user-ID binary or by root.
+Kill mode is available on Linux only.
+.SH OPTIONS
+Options are recognized only as the first argument.
+.TP
+.BR \-\-help ", " \-h
+Print a usage summary to standard output and exit with status 0.
+.TP
+.BR \-\-version ", " \-v
+Print the program name, version, and copyright notice
+to standard output and exit with status 0.
+.TP
+.BI \-\-kill= pid
+Send
+.B SIGTERM
+to the given process
+(see
+.IR "Kill mode" ).
+.P
+A first argument that begins with a hyphen and is not one of the above,
+a first argument that consists only of digits,
+and
+.B \-\-kill
+without
+.BI = pid
+are usage errors:
+the usage summary is printed and
+.B safexec
+exits with status 3.
 .SH EXIT STATUS
 .TP
 .B 0
-Success: the target program was exec'd, or
-.BR --help / --version
-was requested, or
-.B --kill
-succeeded.
+.BR \-\-help ,
+.BR \-\-version ,
+or a successful
+.BR \-\-kill .
+.TP
+.I "status of the tool"
+After the tool has been executed
+.B safexec
+no longer exists,
+so the caller sees the exit status of the tool unchanged.
 .TP
 .B 1
-Usage error, disallowed program, prelude validation failure, privilege-drop
-failure, or exec failure.
-.SH LIMITATIONS
+.B \-\-kill
+failed: invalid PID, nonexistent process, ineligible process,
+signal failure, or a non-Linux system.
+.TP
+.B 3
 .B safexec
-is not a general-purpose sandbox. It constrains only the process it
-execs and that process's descendants; it does not provide syscall-level
-filtering. Only allowlisted tools may be run through the prelude rules
-described above \(em arbitrary commands or shell pipelines are rejected.
+refused the request or failed before executing the tool.
+This covers usage errors;
+a tool that is not allowlisted or is a shell;
+a tool or wrapper that cannot be resolved to a trusted pathname;
+a rejected prelude
+(wrapper path outside the trusted directories, path-like option,
+disallowed assignment, or more than 16 assignments);
+an
+.B rg
+directory that is missing, relative, not a directory,
+a symbolic link, root-owned, or owned by a user absent from the
+password database;
+isolation that fails when
+.B \%SAFEXEC_DETACH
+is
+.BR cgv2 ;
+a privilege drop that leaves the effective user ID at 0;
+and a failure of the final
+.BR exec .
+.P
+Status 3 is also a valid exit status of some tools,
+and
+.BR rg (1)
+itself uses 0, 1, and 2.
+A caller that must distinguish a refusal from a tool failure
+should also inspect standard error,
+which
+.B SAFEXEC_QUIET
+suppresses.
+.SH ENVIRONMENT
+These variables are read before the environment is cleared.
+.TP
+.B SAFEXEC_DETACH
+Selects the isolation method in privileged mode.
+The value is not case-sensitive.
+An unrecognized or empty value selects
+.BR auto .
+.RS
+.TP
+.B auto
+(default)
+Use cgroup v2 and fall back to resource limits if it cannot be used.
+.TP
+.B cgv2
+Use cgroup v2 only.
+If it is unavailable or the join fails,
+.B safexec
+exits with status 3.
+.TP
+.B rlimits
+Skip cgroups and apply resource limits.
+.TP
+.B off
+Set up no isolation.
+.RE
+.IP
+On glibc the variable is read with
+.BR secure_getenv (3),
+so it is ignored when an unprivileged user runs the set-user-ID binary.
+Only root, or a caller running a binary that is not set-user-ID,
+can change the mode.
+On other C libraries it is read with
+.BR getenv (3).
+.TP
+.B SAFEXEC_QUIET
+Suppress the diagnostics that
+.B safexec
+writes,
+including errors and the usage summary.
+The output of the tool,
+the version text,
+and the success message of
+.B \-\-kill
+are not affected.
+The values
+.BR 1 ,
+.BR true ,
+.BR yes ,
+and
+.B on
+enable it;
+.BR 0 ,
+.BR false ,
+.BR no ,
+and
+.B off
+disable it;
+matching is not case-sensitive.
+Any other value selects the compiled-in default,
+which is 0 unless changed with
+.BR \-DSAFEXEC_QUIET_DEFAULT .
+.TP
+.B SAFEXEC_SAFE_CWD
+Controls whether
+.B safexec
+changes to
+.I /tmp
+(or, if that fails,
+.IR / )
+when the working directory is not writable.
+The check is made after privileges are dropped.
+The values
+.BR 1 ,
+.BR true ,
+.BR yes ,
+and
+.B on
+enable the change unconditionally;
+.BR 0 ,
+.BR false ,
+.BR no ,
+and
+.B off
+disable it.
+Any other value, including
+.BR \-1 ,
+selects the compiled-in default,
+which is \-1 unless changed with
+.BR \-DSAFEXEC_SAFE_CWD_DEFAULT .
+The setting \-1 acts only when standard input, output, or error
+is a terminal.
+.SH FILES
+.TP
+.I /usr/local/sbin/safexec
+Default installation path of the binary.
+Mode 4755 (owner root) enables privileged mode.
+.TP
+.I /usr/local/share/man/man1/safexec.1
+Default installation path of this manual page.
+.TP
+.I /sys/fs/cgroup/safexec\-run/
+Base cgroup v2 parent, created on demand.
+See
+.IR Isolation
+for the alternative location under
+.IR /sys/fs/cgroup/unified .
+.TP
+.IR /sys/fs/cgroup/safexec\-run/safexec\-run. pid
+Per-invocation cgroup v2 group.
+.TP
+.I /tmp/safexec\-work/
+Root-owned, mode 1777 parent of the fallback download directories used for
+.BR wget .
+.TP
+.IR /tmp/safexec\-work/ uid
+Per-user download directory, mode 0700.
+.TP
+.IR /proc/ pid /status ", " /proc/ pid /cgroup
+Read by
+.B \-\-kill
+to check the owner and the isolation of the target.
+.TP
+.I /proc/self/fd
+Read to close inherited file descriptors.
+.SH NOTES
+.SS Diagnostics
+Informational, warning, and error messages are written to standard error
+with the prefixes
+.BR Info: ,
+.BR Warning: ,
+.BR Error: ,
+.BR Fatal: ,
+.BR Note: ,
+and
+.BR Summary: .
+The usage summary,
+the version text,
+and the success message of
+.B \-\-kill
+go to standard output.
+.B SAFEXEC_QUIET
+suppresses the messages on standard error and the usage summary.
+It does not suppress the version text or the success message of
+.BR \-\-kill .
+.P
+In privileged mode, just before the tool is executed,
+.B safexec
+prints the identity it runs under,
+the state of no-new-privileges,
+and the cgroup or the fact that resource limits are in effect,
+followed by the limit values it can read from the cgroup:
+.P
+.in +4n
+.EX
+Info: pinned tool \(aqsha256sum\(aq \-> \(aq/usr/bin/sha256sum\(aq
+Info: using cgroup v2 child /sys/fs/cgroup/safexec\-run/safexec\-run.\fIpid\fP
+Summary: user=65534:65534 (ruid=65534 rgid=65534) cwd=\fI...\fP tool=/usr/bin/sha256sum
+Summary: no_new_privs=on
+Summary: cgroup=/sys/fs/cgroup/safexec\-run/safexec\-run.\fIpid\fP
+.EE
+.in
+.SS Installation
+.B safexec
+provides its privilege drop only when installed set-user-ID root:
+.P
+.in +4n
+.EX
+chown root:root /usr/local/sbin/safexec
+chmod 4755 /usr/local/sbin/safexec
+.EE
+.in
+.P
+Do not install it on a
+.B nosuid
+filesystem.
+To restrict who can invoke it,
+use mode 4750 and a dedicated group.
+The Makefile installs with mode 0755 by default,
+so that unprivileged package builds work,
+and never changes ownership;
+the package must set the set-user-ID bit,
+for example with
+.BR "make install BINMODE=4755" .
+Some packaging tools, such as
+.BR \%dh_fixperms
+on Debian,
+remove the bit and must be told to restore it.
+.SS Building
+The optional tool groups are enabled with preprocessor macros:
+.P
+.in +4n
+.EX
+make EXTRA_CPPFLAGS="\-DSAFEXEC_WITH_POPPLER \-DSAFEXEC_WITH_DB"
+.EE
+.in
+.P
+The macros are
+.BR SAFEXEC_WITH_GS ,
+.BR SAFEXEC_WITH_POPPLER ,
+.BR SAFEXEC_WITH_DB ,
+and
+.BR SAFEXEC_WITH_RSYNC_GIT .
+.B gs
+has a long history of sandbox-escape vulnerabilities,
+and
+.B rsync
+and
+.B git
+can start
+.BR ssh (1),
+which lies outside the closed set of tools the allowlist assumes.
+Enable these groups only if you control how the tools are invoked.
+.P
+.B \-DSAFEXEC_QUIET_DEFAULT
+and
+.B \-DSAFEXEC_SAFE_CWD_DEFAULT
+set the compiled-in defaults of the corresponding variables.
+Statically linked musl binaries do not load NSS modules,
+so users provided by LDAP or SSSD are not resolved;
+this affects the owner lookup for
+.BR rg .
+.SS Platforms
+Linux supports the full feature set.
+Other POSIX systems get the allowlist, path pinning, resource limits,
+and descriptor closing,
+but no cgroups,
+no
+.BR pidfd_send_signal (2),
+and no
+.BR \-\-kill .
+.SS Testing
+.B make check
+runs a smoke test that needs no root privileges;
+it skips the privilege-drop test unless run as root
+against a set-user-ID root binary.
+A separate end-to-end suite,
+.IR tests/run\-all.sh ,
+modifies the host by installing packages,
+adding users,
+and installing set-user-ID root binaries.
+It refuses to run unless
+.B SAFEXEC_TEST_CONTAINER=1
+is set and must be run only in a disposable container or virtual machine.
+.SH CAVEATS
+.B safexec
+is not a general-purpose sandbox.
+It constrains the process it starts and its descendants,
+and it permits only allowlisted tools,
+but it does not filter the arguments of those tools.
+Options such as
+.B "rg \-\-pre"
+and
+.B "wget \-\-execute"
+make the tool run programs or modify files
+with the privileges of the target user.
+Expose the set-user-ID binary only to callers that are trusted with this.
+.P
+In pass-through mode none of the protections beyond the allowlist
+and path pinning are in effect.
+.P
+A caller that may run
+.B safexec
+may run
+.B rg
+over any directory that is not owned by root,
+with the privileges of the owner of that directory.
+.P
+Any caller that may run
+.B safexec
+may send
+.B SIGTERM
+to any eligible process with
+.BR \-\-kill ;
+the caller is not required to have started the process.
+.P
+Tools run as
+.BR nobody ,
+so files they create belong to
+.BR nobody ,
+and files that they are to read must be readable by that user.
+The caller's environment,
+including proxy variables,
+does not reach the tool;
+use proxy assignments in the prelude instead.
+.P
+Trust in the resolved pathname rests on its directory alone.
+The trusted directories must not be writable by untrusted users.
+.SH BUGS
+Wrapper options that take a value as a separate word,
+such as
+.IR "timeout \-s KILL" ,
+are refused.
+.P
+The
+.B wget
+directory rewrite recognizes only the two-argument form
+.BR "\-P /tmp" .
+.P
+Programs that are links to targets outside the trusted directories,
+such as the PostgreSQL clients on Debian,
+cannot be used.
 .SH EXAMPLES
-Fetch a URL with resource isolation applied automatically when installed
-setuid-root:
-.PP
-.RS
-.nf
-safexec wget -q -O /tmp/nppp-cache/out.html https://example.com/
-.fi
-.RE
-.PP
-Run with a wrapper command and a numeric argument in the prelude:
-.PP
-.RS
-.nf
-safexec timeout 30 wget -q -O /tmp/out.html https://example.com/
-.fi
-.RE
-.PP
-Terminate a previously started safexec child by PID:
-.PP
-.RS
-.nf
-safexec --kill=12345
-.fi
-.RE
-.SH AUTHOR
-Hasan Calisir <hasan.calisir@psauxit.com>
+Fetch a page:
+.P
+.in +4n
+.EX
+safexec curl \-fsS \-o /var/tmp/page.html https://example.com/
+.EE
+.in
+.P
+Use a wrapper chain and a proxy variable:
+.P
+.in +4n
+.EX
+safexec HTTP_PROXY=http://127.0.0.1:3128 nice \-n 10 timeout 30 \e
+        curl \-fsSL https://example.com/
+.EE
+.in
+.P
+Compute a checksum:
+.P
+.in +4n
+.EX
+safexec sha256sum /srv/data/archive.tar.gz
+.EE
+.in
+.P
+Search a project directory as the user that owns it:
+.P
+.in +4n
+.EX
+safexec rg \-m 1 \-\-text \(aqpattern\(aq /home/alice/project
+.EE
+.in
+.P
+Start a job in the background and stop it later.
+The process ID stays the same because
+.B safexec
+replaces itself with the tool:
+.P
+.in +4n
+.EX
+safexec ffmpeg \-v error \-i in.mp4 out.webm &
+pid=$!
+safexec \-\-kill=$pid
+.EE
+.in
+.P
+Requests that are refused:
+.P
+.in +4n
+.EX
+$ \fBsafexec ls /\fP
+Error: \(aqls\(aq is not allowed by safexec.
+$ \fBecho $?\fP
+3
+$ \fBsafexec /bin/sh \-c id\fP
+Info: rejecting shell interpreter before tool: \(aq/bin/sh\(aq
+Error: \(aqsh\(aq is not allowed by safexec.
+.EE
+.in
+.P
+Suppress diagnostics and rely on the exit status:
+.P
+.in +4n
+.EX
+SAFEXEC_QUIET=1 safexec sha256sum /srv/data/archive.tar.gz
+.EE
+.in
+.SH REPORTING BUGS
+Report bugs through
+.UR https://github.com/psaux-it/safexec
+the safexec repository on GitHub
+.UE .
 .SH SEE ALSO
-.BR wget (1),
+.ad l
+.nh
+.BR chrt (1),
 .BR curl (1),
+.BR ionice (1),
+.BR nice (1),
+.BR nohup (1),
 .BR rg (1),
+.BR setsid (1),
+.BR stdbuf (1),
+.BR taskset (1),
+.BR time (1),
+.BR timeout (1),
+.BR wget (1),
+.BR execve (2),
+.BR pidfd_send_signal (2),
+.BR prctl (2),
+.BR setrlimit (2),
+.BR setuid (2),
+.BR passwd (5),
 .BR cgroups (7),
-.BR pidfd_open (2),
-.BR prctl (2)
+.BR credentials (7)
+.hy
+.ad
