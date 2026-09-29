@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: MIT
 #
-# safexec end-to-end test suite
+# safexec end-to-end suite (tests/run-all.sh) inside a GitHub Actions job container.
 #
-# The suite is host-modifying by design: it adds
+# Why a *privileged* job container?  The suite is host-modifying by design: it adds
 # users, installs SETUID-ROOT binaries and exercises cgroup v2 + mount namespaces +
 # privilege dropping.  It therefore needs a disposable root environment with:
 #   - writable cgroup v2 (safexec creates /sys/fs/cgroup/safexec-run/...)   -> --privileged
 #   - unshare/mount (per-run mount namespace for the /tmp fallback)         -> --privileged
 #   - setuid to work (no `no-new-privileges`)                               -> default off
+# A GitHub-hosted runner VM is single-use, so this is contained.  Do not point this
+# workflow at a long-lived self-hosted runner.
 
 name: safexec CI
 
@@ -58,14 +60,17 @@ jobs:
     container:
       image: ubuntu:24.04
       # --privileged   : rw cgroupfs, unshare/mount, all caps, no seccomp/AppArmor confinement
-      # --cgroupns=private : explicit, so /sys/fs/cgroup is the container's own subtree and
-      #                  safexec never creates /safexec-run at the host's cgroup root
+      # --cgroupns=host: safexec hard-codes its cgroup base as <cgroup root>/safexec-run under
+      #                  /sys/fs/cgroup.  With a *private* cgroup namespace that root is the
+      #                  container's own scope, where the kernel answers EOPNOTSUPP to
+      #                  subtree_control / cgroup.procs writes (first CI run: 4 failures).
+      #                  The runner VM is single-use, so using the host's cgroup root is safe.
       # --init         : PID 1 reaps the orphaned tool processes the --kill tests leave behind
       #                  (the runner's own PID 1 is `tail -f /dev/null`, which never reaps)
       # --user root    : the suite must run as root regardless of the image's default USER
       options: >-
         --privileged
-        --cgroupns=private
+        --cgroupns=host
         --init
         --user root
 
@@ -82,8 +87,10 @@ jobs:
             > /etc/apt/apt.conf.d/80-ci-retries
           apt-get update
           # git: so checkout gets a real clone (not the REST tarball fallback);
-          # procps: test-suite.sh uses pkill in its EXIT trap (absent in the minimal image).
-          apt-get install -y --no-install-recommends ca-certificates git procps
+          # procps: test-suite.sh uses pkill in its EXIT trap; file: it validates PDF/PNG output
+          # with `file(1)`.  Both are absent from the minimal image (and from run-all.sh's
+          # install_deps, which only surfaces as failures in a fresh container).
+          apt-get install -y --no-install-recommends ca-certificates file git procps
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -106,9 +113,22 @@ jobs:
           # The suite asserts cgroup v2 behaviour (sections 4, 10, 12).
           [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] \
             || fail "/sys/fs/cgroup is not cgroup v2 ($(stat -fc %T /sys/fs/cgroup))"
-          mkdir /sys/fs/cgroup/ci-preflight \
-            || fail "cannot create cgroups (is the container --privileged?)"
-          rmdir /sys/fs/cgroup/ci-preflight
+
+          # Probe what safexec actually does: create a cgroup, enable a controller in it, then
+          # MOVE A PROCESS into it.  mkdir alone is not enough: a container can allow mkdir yet
+          # answer EOPNOTSUPP on subtree_control / cgroup.procs writes (target below a threaded
+          # or thread-root cgroup).  Warn (do not abort) so the full suite still reports.
+          probe=/sys/fs/cgroup/ci-probe
+          mkdir "$probe" || fail "cannot create cgroups (is the container --privileged?)"
+          echo "own cgroup: $(cut -d: -f3 /proc/self/cgroup)"
+          echo "root controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+          if ! echo +pids > "$probe/cgroup.subtree_control"; then
+            echo "::warning title=cgroup probe::enabling a controller in a new cgroup failed"
+          fi
+          if ! ( echo "$BASHPID" > "$probe/cgroup.procs" ); then
+            echo "::warning title=cgroup probe::moving a process into a new cgroup failed; cgroup tests will fail"
+          fi
+          rmdir "$probe" || true
 
           # Per-run mount namespace used by the wget -P /tmp fallback (section 11).
           unshare --mount true || fail "unshare --mount denied (seccomp/AppArmor/caps?)"
@@ -163,8 +183,17 @@ jobs:
       - name: Cgroup diagnostics (on failure)
         if: ${{ failure() }}
         run: |
+          own="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"
           echo "--- /proc/self/cgroup"; cat /proc/self/cgroup
-          echo "--- /sys/fs/cgroup/safexec-run (top)"; find /sys/fs/cgroup/safexec-run -maxdepth 1 2>&1 | head -n 40
+          echo "--- mounts"; grep cgroup /proc/self/mountinfo || true
+          for d in /sys/fs/cgroup "$own" /sys/fs/cgroup/safexec-run; do
+            echo "--- $d"
+            for f in cgroup.type cgroup.controllers cgroup.subtree_control; do
+              [[ -r "$d/$f" ]] && echo "$f: $(cat "$d/$f")"
+            done
+            true
+          done
+          echo "--- safexec-run children"; find /sys/fs/cgroup/safexec-run -maxdepth 1 2>&1 | head -n 20
           echo "--- leftovers"; find /tmp/safexec-work -maxdepth 2 2>&1 | head -n 20
 
       - name: Upload logs
