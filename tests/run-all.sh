@@ -51,7 +51,7 @@ install_deps() {
     apt-get update || return 1
 
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        build-essential python3 git time curl wget zip unzip xz-utils \
+        build-essential python3 git time file procps curl wget zip unzip xz-utils \
         ffmpeg imagemagick wkhtmltopdf pdftk-java pandoc poppler-utils \
         ripgrep rsync ghostscript redis-tools mariadb-client postgresql-client \
         || return 1
