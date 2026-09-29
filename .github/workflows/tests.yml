@@ -1,0 +1,177 @@
+# SPDX-License-Identifier: MIT
+#
+# safexec end-to-end test suite
+#
+# The suite is host-modifying by design: it adds
+# users, installs SETUID-ROOT binaries and exercises cgroup v2 + mount namespaces +
+# privilege dropping.  It therefore needs a disposable root environment with:
+#   - writable cgroup v2 (safexec creates /sys/fs/cgroup/safexec-run/...)   -> --privileged
+#   - unshare/mount (per-run mount namespace for the /tmp fallback)         -> --privileged
+#   - setuid to work (no `no-new-privileges`)                               -> default off
+
+name: safexec CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 4 * * 1'   # weekly: catch distro / apt package / runner-image drift
+  workflow_dispatch:
+    inputs:
+      fuzz_runs:
+        description: 'Parser-fuzz repetitions (each run = 400k iterations)'
+        type: string
+        default: '3'
+
+# Least privilege: nothing here writes to the repo or the API.
+permissions:
+  contents: read
+
+# New push to the same PR/branch supersedes the running one (never cancel main/schedule runs).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # Inside a container the default shell is `sh`, not bash (GitHub docs);
+    # the test scripts and the steps below are bash.
+    shell: bash
+
+jobs:
+  e2e:
+    name: e2e (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    # Experimental legs report failures but do not fail the workflow.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Pin concrete labels: `ubuntu-latest` moves to 26.04 between 2026-10-19 and 2026-11-19.
+          - { name: 'ubuntu-24.04 x64',            runner: ubuntu-24.04,     experimental: false }
+          - { name: 'ubuntu-24.04 arm64',          runner: ubuntu-24.04-arm, experimental: true }
+          - { name: 'ubuntu-26.04 x64 (new host)', runner: ubuntu-26.04,     experimental: true }
+
+    container:
+      image: ubuntu:24.04
+      # --privileged   : rw cgroupfs, unshare/mount, all caps, no seccomp/AppArmor confinement
+      # --cgroupns=private : explicit, so /sys/fs/cgroup is the container's own subtree and
+      #                  safexec never creates /safexec-run at the host's cgroup root
+      # --init         : PID 1 reaps the orphaned tool processes the --kill tests leave behind
+      #                  (the runner's own PID 1 is `tail -f /dev/null`, which never reaps)
+      # --user root    : the suite must run as root regardless of the image's default USER
+      options: >-
+        --privileged
+        --cgroupns=private
+        --init
+        --user root
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Bootstrap container
+        run: |
+          set -euo pipefail
+          # run-all.sh installs its own dependencies via apt; make that stage survive
+          # transient mirror failures without touching the script.
+          printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\n' \
+            > /etc/apt/apt.conf.d/80-ci-retries
+          apt-get update
+          # git: so checkout gets a real clone (not the REST tarball fallback);
+          # procps: test-suite.sh uses pkill in its EXIT trap (absent in the minimal image).
+          apt-get install -y --no-install-recommends ca-certificates git procps
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preflight (fail fast, with a clear message, on container misconfiguration)
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=preflight::$*"; exit 1; }
+
+          # Safety net: the suite creates users and installs setuid-root binaries.
+          [[ -f /.dockerenv ]] || fail "not inside a container; refusing to run host-modifying tests"
+          [[ $EUID -eq 0 ]]    || fail "must run as root (got uid $EUID)"
+
+          # setuid binaries are silently neutralised by no-new-privileges.
+          grep -q '^NoNewPrivs:[[:space:]]*0' /proc/self/status \
+            || fail "NoNewPrivs is set on the container; setuid tests cannot pass"
+
+          # The suite asserts cgroup v2 behaviour (sections 4, 10, 12).
+          [[ "$(stat -fc %T /sys/fs/cgroup)" == cgroup2fs ]] \
+            || fail "/sys/fs/cgroup is not cgroup v2 ($(stat -fc %T /sys/fs/cgroup))"
+          mkdir /sys/fs/cgroup/ci-preflight \
+            || fail "cannot create cgroups (is the container --privileged?)"
+          rmdir /sys/fs/cgroup/ci-preflight
+
+          # Per-run mount namespace used by the wget -P /tmp fallback (section 11).
+          unshare --mount true || fail "unshare --mount denied (seccomp/AppArmor/caps?)"
+
+          echo "kernel: $(uname -r)  arch: $(uname -m)"
+          echo "cgroup: $(cat /proc/self/cgroup)"
+          grep -E '^Cap(Eff|Bnd):' /proc/self/status
+
+      - name: Make test scripts executable
+        # run-all.sh execs tests/setup-fixtures.sh directly, but the scripts are committed
+        # as 100644.  Permanent fix: git update-index --chmod=+x tests/*.sh
+        run: chmod +x tests/*.sh
+
+      - name: Run end-to-end suite
+        env:
+          SAFEXEC_TEST_CONTAINER: '1'
+          FUZZ_RUNS: ${{ inputs.fuzz_runs || '3' }}
+        run: |
+          set -euo pipefail
+          # FUZZ_RUNS lands in a bash arithmetic context inside run-all.sh.
+          [[ "$FUZZ_RUNS" =~ ^[0-9]+$ ]] || { echo "::error::fuzz_runs must be a number"; exit 1; }
+
+          # Use the $GITHUB_WORKSPACE env var (container path), not the github.workspace
+          # expression: in container jobs the expression has historically been the *host* path.
+          mkdir -p test-results
+          export SXTEST_RESULTS="$GITHUB_WORKSPACE/test-results"
+
+          # pipefail (set above) propagates run-all.sh's exit status through tee.
+          bash tests/run-all.sh 2>&1 | tee "$SXTEST_RESULTS/run-all.log"
+
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        env:
+          LEG: ${{ matrix.name }}
+        run: |
+          log=test-results/run-all.log
+          [[ -f "$log" ]] || exit 0
+          {
+            echo "### safexec e2e: ${LEG}"
+            echo '```'
+            sed -n '/======== OVERALL ========/,$p' "$log"
+            grep -E '^PASS=[0-9]+ FAIL=[0-9]+' "$log" || true
+            echo '```'
+            if grep -qE '^FAIL ' "$log"; then
+              echo '**Failed tests**'
+              echo '```'
+              grep -E '^FAIL ' "$log" | head -n 50
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cgroup diagnostics (on failure)
+        if: ${{ failure() }}
+        run: |
+          echo "--- /proc/self/cgroup"; cat /proc/self/cgroup
+          echo "--- /sys/fs/cgroup/safexec-run (top)"; find /sys/fs/cgroup/safexec-run -maxdepth 1 2>&1 | head -n 40
+          echo "--- leftovers"; find /tmp/safexec-work -maxdepth 2 2>&1 | head -n 20
+
+      - name: Upload logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: safexec-test-results-${{ matrix.runner }}
+          path: test-results/
+          retention-days: 14
+          if-no-files-found: warn
