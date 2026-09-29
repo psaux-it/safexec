@@ -13,6 +13,17 @@
 #   FUZZ_RUNS        parser-fuzz repetitions  (default 3; each run seeds from time())
 
 set -uo pipefail
+
+[[ "${SAFEXEC_TEST_CONTAINER:-}" == 1 ]] || {
+    echo "Run inside a disposable container/VM with SAFEXEC_TEST_CONTAINER=1." >&2
+    exit 2
+}
+
+[[ $EUID -eq 0 ]] || {
+    echo "Must run as root to install dependencies and prepare fixtures." >&2
+    exit 2
+}
+
 cd "$(dirname "$(readlink -f "$0")")/.."
 
 RESULTS="${SXTEST_RESULTS:-/tmp/safexec-test-results}"
@@ -30,6 +41,21 @@ run_stage() { # name cmd...
 
 CFLAGS_SAN="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
 FULL_BUCKETS="-DSAFEXEC_WITH_GS -DSAFEXEC_WITH_POPPLER -DSAFEXEC_WITH_DB -DSAFEXEC_WITH_RSYNC_GIT"
+
+install_deps() {
+    command -v apt-get >/dev/null 2>&1 || {
+        echo "Automatic dependency installation requires apt-get." >&2
+        return 1
+    }
+
+    apt-get update || return 1
+
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        build-essential python3 git time curl wget zip unzip xz-utils \
+        ffmpeg imagemagick wkhtmltopdf pdftk-java pandoc poppler-utils \
+        ripgrep rsync ghostscript redis-tools mariadb-client postgresql-client \
+        || return 1
+}
 
 build() {
     make clean >/dev/null && make >/dev/null || return 1
@@ -53,6 +79,12 @@ fuzz() {
     return $rc
 }
 
+run_stage deps      install_deps
+[[ ${STAGE[deps]} -eq 0 ]] || {
+    echo "dependency installation failed; aborting"
+    exit 1
+}
+
 run_stage build     build
 [[ ${STAGE[build]} -eq 0 ]] || { echo "build failed; aborting"; exit 1; }
 
@@ -65,7 +97,7 @@ run_stage functional bash tests/test-suite.sh
 
 printf '\n======== OVERALL ========\n'
 overall=0
-for s in build fuzz fixtures smoke functional; do
+for s in deps build fuzz fixtures smoke functional; do
     printf '%-12s %s\n' "$s" "$([[ ${STAGE[$s]} -eq 0 ]] && echo OK || echo "FAILED (rc=${STAGE[$s]})")"
     [[ ${STAGE[$s]} -eq 0 ]] || overall=1
 done
